@@ -8,12 +8,12 @@ Windows app that cuts ads out of podcast episodes using a local Whisper transcri
 2. **Download + transcribe** downloads an episode, records the SHA-256 hash of the file, and transcribes it on the CPU with [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Every transcript line has start and end times.
 3. **Copy AI prompt** copies a ready-made prompt plus the transcript to the clipboard. Paste it into any AI chat. No AI service is built in and nothing is sent anywhere by the app.
 4. Paste the AI's reply into the reply box and press **Check cuts**. The reply must be a list of ad time ranges (format below). Podcast Trim never runs commands from the reply. It checks that every range is inside the episode, ends after it starts, and does not overlap another range, then shows the cut list and the exact ffmpeg command it will run.
-5. **Approve and cut** runs ffmpeg itself (as an argument list, without a shell) and writes an MP3 without the ads. The original download is deleted.
+5. **Approve and cut** runs ffmpeg itself (as an argument list, without a shell) and writes an Ogg Opus file (`.opus`) without the ads. The original download is deleted.
 6. The trimmed episode appears in that show's feed at `http://<this-pc>:8737/feed/<show-id>.xml`. Subscribe to that link in AntennaPod or another podcast app.
 7. Once a client has downloaded every byte of a trimmed file, the file is deleted and the episode is marked SENT. The app keeps the hash, the transcript, the cut list, and the ffmpeg arguments.
 8. **Regenerate** on a SENT episode downloads the original again, checks that its hash matches, and rebuilds the trimmed file from the saved cuts without transcribing again or asking the AI again. If the publisher has changed the file (for example, new ads were inserted), the hash will not match, the old cuts are discarded, and the episode goes back to the transcribe step.
 
-**Export MP3** copies a trimmed episode to the export folder set in Options, for use without the feed.
+**Export Opus** copies a trimmed episode to the export folder set in Options, for use without the feed.
 
 ## AI reply format
 
@@ -40,13 +40,23 @@ Anything else is rejected with the line number of the problem.
 - The server speaks plain HTTP. To reach it from outside your home network, use a private VPN such as Tailscale instead of opening a port on your router.
 - Windows Firewall will ask whether to allow Podcast Trim on the network the first time it starts. Allow it on private networks.
 
+## Audio format
+
+Trimmed episodes are Ogg Opus (`.opus`, encoded with libopus), 64 kbit/s variable bitrate by default, which is plenty for speech. The bitrate (6 to 256 kbit/s) and a **Mono** switch are in Options. Feeds list them with the MIME type `audio/ogg`, the registered type for Ogg Opus files (RFC 7845). AntennaPod plays them through its built-in player (ExoPlayer) on Android 5 and later.
+
 ## Run
 
-1. Copy `Podcast Trim.exe` to a folder.
-2. Get FFmpeg from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) and put `ffmpeg.exe` and `ffprobe.exe` next to it, or enter their full paths in Options.
-3. Get the whisper.cpp Windows build `whisper-bin-x64.zip` from the [whisper.cpp releases](https://github.com/ggml-org/whisper.cpp/releases) and unzip it. In Options, set **whisper-cli.exe** to the full path of `Release\whisper-cli.exe`.
-4. Download a model such as `ggml-base.en.bin` from [the whisper.cpp models page](https://huggingface.co/ggerganov/whisper.cpp/tree/main) and set **Whisper model** to its full path. Larger models are more accurate and slower on the CPU. `base.en` or `small.en` is a reasonable start for English shows.
-5. Start `Podcast Trim.exe`, press **Options**, check the paths, and press **Save**.
+Everything Podcast Trim needs must be in the same folder as `Podcast Trim.exe`:
+
+| File | From |
+| --- | --- |
+| `ffmpeg.exe`, `ffprobe.exe` | FFmpeg, the `bin` folder of a [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) build |
+| `whisper-cli.exe`, `whisper.dll`, `ggml.dll`, `ggml-base.dll`, `ggml-cpu-*.dll` | the `Release` folder of `whisper-bin-x64.zip` from the [whisper.cpp releases](https://github.com/ggml-org/whisper.cpp/releases) (copying the whole folder is fine) |
+| one or more `ggml-*.bin` models | [whisper.cpp models](https://huggingface.co/ggerganov/whisper.cpp/tree/main), for example `ggml-base.en.bin` |
+
+1. Put `Podcast Trim.exe` and the files above in one folder.
+2. Start `Podcast Trim.exe`. If anything is missing, the status line lists what is missing and where it goes, and transcribing and cutting stay unavailable until it is there.
+3. If there is more than one model in the folder, press **Options**, click the **Whisper model** button to switch between them, and press **Save**. Larger models are more accurate and slower on the CPU. `base.en` or `small.en` is a reasonable start for English shows.
 
 Settings, the show list, and episode records are stored in `%AppData%\Podcast Trim`. Set the `PODCAST_TRIM_DATA` environment variable to use another folder.
 
@@ -61,6 +71,12 @@ cargo build --release
 cp target/x86_64-pc-windows-gnu/release/podcast-trim.exe "dist/Podcast Trim.exe"
 ```
 
+Release builds link the C runtime statically:
+
+```
+RUSTFLAGS="-C target-feature=+crt-static" cargo build --release
+```
+
 Tests run the Windows build under Wine (the runner set in `.cargo/config.toml`), or natively on Linux:
 
 ```
@@ -69,11 +85,11 @@ cargo test --target x86_64-unknown-linux-gnu --lib
 cargo clippy --all-targets
 ```
 
-`tests/e2e.rs` runs the whole download, transcribe, cut, deliver, and regenerate cycle with the real tools when `PT_FFMPEG`, `PT_FFPROBE`, `PT_WHISPER`, `PT_MODEL`, and `PT_SAMPLE` (a short audio file, such as whisper.cpp's `samples/jfk.mp3`) are set. Otherwise it is skipped.
+`tests/e2e.rs` runs the whole download, transcribe, cut, deliver, and regenerate cycle with the real tools when `PT_TOOLS_DIR` (a folder with the same files as the app folder) and `PT_SAMPLE` (a short audio file, such as whisper.cpp's `samples/jfk.mp3`) are set. Otherwise it is skipped.
 
 ## Look
 
-The window copies the general look of late-1990s game menus: olive panels, khaki headings, 1-pixel light and dark bevels, and flat beveled buttons. It is drawn with plain Win32 and GDI. Text uses Tahoma, a font that ships with Windows, without anti-aliasing. No game assets are included. Scroll bars are the standard Windows ones.
+The window copies the general look of late-1990s game menus: olive panels, khaki headings, 1-pixel light and dark bevels, and flat beveled buttons. It is drawn with plain Win32 and GDI. Text uses the Pixel Operator pixel font (CC0), embedded in the exe and drawn without smoothing. No game assets are included. Scroll bars are the standard Windows ones.
 
 ## License
 

@@ -1,7 +1,7 @@
 //! Small HTTP/1.1 server: one RSS feed per show and the cleaned MP3s.
 //!
 //! GET /feed/<show-id>.xml[?token=T]
-//! GET /media/<show-id>/<episode-key>.mp3[?token=T]   (Range supported)
+//! GET /media/<show-id>/<episode-key>.opus[?token=T]   (Range supported)
 //!
 //! When the bytes sent for a cleaned file cover the whole file, it is deleted
 //! and the episode is marked Delivered (record kept).
@@ -170,7 +170,7 @@ pub fn feed_xml(shared: &Shared, show_id: u32, host: &str) -> Option<String> {
             guid: format!("podcast-trim:{}", e.guid),
             title: e.title.clone(),
             pub_date: e.pub_date.clone(),
-            url: format!("{base}/media/{show_id}/{}.mp3{tok}", e.key()),
+            url: format!("{base}/media/{show_id}/{}.opus{tok}", e.key()),
             length: e.cleaned_bytes,
             description: format!(
                 "Removed {} of ads in {} cut(s).",
@@ -247,7 +247,7 @@ fn handle(mut stream: TcpStream, shared: SharedRef, notify: Notify) {
             }
         }
         ["media", show, file] => {
-            let (Ok(id), Some(key)) = (show.parse::<u32>(), file.strip_suffix(".mp3")) else {
+            let (Ok(id), Some(key)) = (show.parse::<u32>(), file.strip_suffix(".opus")) else {
                 return respond(
                     &mut stream,
                     "404 Not Found",
@@ -324,7 +324,7 @@ fn serve_file(
         None => (0, len, "200 OK"),
     };
     let mut hdr = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: audio/mpeg\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: audio/ogg\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n",
         end - start
     );
     if status.starts_with("206") {
@@ -480,7 +480,7 @@ mod tests {
         let (h, body) = get(addr, &format!("/feed/{id}.xml?token={token}"), "");
         assert!(h.contains("200"));
         let xml = String::from_utf8(body).unwrap();
-        let media = format!("/media/{id}/{key}.mp3?token={token}");
+        let media = format!("/media/{id}/{key}.opus?token={token}");
         assert!(xml.contains(&format!("http://{addr}{}", media.replace('&', "&amp;"))));
 
         let (h, body) = get(addr, &media, "Range: bytes=0-4\r\n");

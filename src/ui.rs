@@ -70,17 +70,17 @@ const B_BACK: i32 = 211;
 const B_TOKEN: i32 = 212;
 const OPT_BASE: i32 = 300;
 
-const OPTION_LABELS: [&str; 11] = [
-    "FFMPEG.EXE",
-    "FFPROBE.EXE",
-    "WHISPER-CLI.EXE",
-    "WHISPER MODEL",
+const B_MONO: i32 = 213;
+const B_MODEL: i32 = 214;
+
+/// Edit rows on the Options page; row 0 is the model picker button.
+const OPTION_LABELS: [&str; 7] = [
     "CPU THREADS",
     "LANGUAGE",
     "LISTEN ADDRESS",
     "PORT",
     "PC ADDRESS FOR PHONE",
-    "MP3 BITRATE (KBPS)",
+    "OPUS BITRATE (KBPS)",
     "EXPORT FOLDER",
 ];
 
@@ -100,6 +100,9 @@ struct Ui {
     busy: bool,
     options: bool,
     token_on: bool,
+    mono_on: bool,
+    models: Vec<String>,
+    model: String,
     server_addr: String,
     frames: Vec<RECT>,
     labels: Vec<(RECT, String, bool)>,
@@ -194,8 +197,26 @@ fn scale(v: i32, dpi: i32) -> i32 {
     v * dpi / 96
 }
 
+static PIXEL_REGULAR: &[u8] = include_bytes!("../assets/fonts/PixelOperator.ttf");
+static PIXEL_BOLD: &[u8] = include_bytes!("../assets/fonts/PixelOperator-Bold.ttf");
+
+/// Register the embedded Pixel Operator fonts for this process only.
+fn load_fonts() {
+    for data in [PIXEL_REGULAR, PIXEL_BOLD] {
+        let mut count = 0u32;
+        unsafe {
+            windows::Win32::Graphics::Gdi::AddFontMemResourceEx(
+                data.as_ptr() as *const core::ffi::c_void,
+                data.len() as u32,
+                None,
+                std::ptr::addr_of_mut!(count) as *const u32,
+            );
+        }
+    }
+}
+
+/// Pixel Operator is drawn on a 16 px grid; use multiples of it, unsmoothed.
 fn make_font(px: i32, bold: bool) -> HFONT {
-    // Tahoma without anti-aliasing reads like the old VGUI bitmap text.
     unsafe {
         CreateFontW(
             px.neg(),
@@ -211,7 +232,7 @@ fn make_font(px: i32, bold: bool) -> HFONT {
             0,
             3,
             0,
-            w!("Tahoma"),
+            w!("Pixel Operator"),
         )
     }
 }
@@ -246,6 +267,8 @@ pub fn run() -> i32 {
         .next_id
         .max(lib.shows.iter().map(|s| s.id + 1).max().unwrap_or(1));
     let token_on = settings.require_token;
+    let mono_on = settings.mono;
+    let model = settings.whisper_model.clone();
     let shared: SharedRef = Arc::new(Mutex::new(Shared {
         lib,
         settings,
@@ -266,6 +289,7 @@ pub fn run() -> i32 {
             ..Default::default()
         };
         RegisterClassW(&class);
+        load_fonts();
         let dc = GetDC(None);
         let dpi = GetDeviceCaps(dc, LOGPIXELSX).max(96);
         ReleaseDC(None, dc);
@@ -300,8 +324,8 @@ pub fn run() -> i32 {
         let ui = Ui {
             hwnd,
             shared: shared.clone(),
-            font: make_font(scale(11, dpi), false),
-            title_font: make_font(scale(18, dpi), true),
+            font: make_font(16 * (dpi / 96).max(1), false),
+            title_font: make_font(32 * (dpi / 96).max(1), true),
             brush_field: CreateSolidBrush(COLORREF(FIELD)),
             brush_bg: CreateSolidBrush(COLORREF(BG)),
             dpi,
@@ -312,6 +336,9 @@ pub fn run() -> i32 {
             busy: false,
             options: false,
             token_on,
+            mono_on,
+            models: podcast_trim::tools::models(&podcast_trim::tools::exe_dir()),
+            model,
             server_addr: String::new(),
             frames: vec![],
             labels: vec![],
@@ -332,7 +359,13 @@ pub fn run() -> i32 {
         with(|ui| match started {
             Ok(addr) => {
                 ui.server_addr = addr.to_string();
-                status(ui, &format!("Feed server listening on {addr}."));
+                let dir = podcast_trim::tools::exe_dir();
+                let miss = podcast_trim::tools::missing(&dir);
+                if miss.is_empty() {
+                    status(ui, &format!("Feed server listening on {addr}."));
+                } else {
+                    status(ui, &podcast_trim::tools::missing_message(&dir, &miss));
+                }
             }
             Err(e) => status(ui, &e),
         });
@@ -481,7 +514,7 @@ fn build_controls(instance: HINSTANCE) {
             ui,
             instance,
             bt,
-            "Export MP3...",
+            "Export Opus...",
             BTN,
             B_EXPORT,
             (474, 442, 158, 24),
@@ -566,10 +599,6 @@ fn build_controls(instance: HINSTANCE) {
         // Options page (hidden until opened)
         let s = ui.shared.lock().unwrap().settings.clone();
         let vals = [
-            s.ffmpeg,
-            s.ffprobe,
-            s.whisper_cli,
-            s.whisper_model,
             s.threads.to_string(),
             s.language,
             s.bind,
@@ -579,7 +608,7 @@ fn build_controls(instance: HINSTANCE) {
             s.export_dir,
         ];
         for (i, v) in vals.iter().enumerate() {
-            let y = 80 + i as i32 * 34;
+            let y = 80 + (i as i32 + 1) * 34;
             let h = child(
                 ui,
                 instance,
@@ -598,8 +627,20 @@ fn build_controls(instance: HINSTANCE) {
             "",
             BTN,
             B_TOKEN,
-            (220, 80 + 11 * 34, 260, 24),
+            (220, 80 + 9 * 34, 260, 24),
         );
+        let _ = ShowWindow(h, SW_HIDE);
+        let h = child(
+            ui,
+            instance,
+            bt,
+            "",
+            BTN,
+            B_MONO,
+            (490, 80 + 9 * 34, 260, 24),
+        );
+        let _ = ShowWindow(h, SW_HIDE);
+        let h = child(ui, instance, bt, "", BTN, B_MODEL, (220, 80, 600, 22));
         let _ = ShowWindow(h, SW_HIDE);
         for id in [B_SAVE, B_BACK] {
             let (t, x) = if id == B_SAVE {
@@ -631,7 +672,7 @@ fn set_page(options: bool) {
                 if options { SW_SHOW } else { SW_HIDE },
             );
         }
-        for id in [B_TOKEN, B_SAVE, B_BACK] {
+        for id in [B_TOKEN, B_MONO, B_MODEL, B_SAVE, B_BACK] {
             let _ = ShowWindow(ui.ctl[&id], if options { SW_SHOW } else { SW_HIDE });
         }
         let _ = InvalidateRect(ui.hwnd, None, true);
@@ -839,6 +880,24 @@ fn update_buttons() {
                 w!("[  ] Require feed token")
             },
         );
+        let mono = wide(if ui.mono_on { "[X] Mono" } else { "[  ] Mono" });
+        let _ = SetWindowTextW(ui.ctl[&B_MONO], PCWSTR(mono.as_ptr()));
+        let model = if ui.models.is_empty() {
+            "No ggml-*.bin model next to Podcast Trim.exe".to_string()
+        } else {
+            let cur = ui
+                .models
+                .iter()
+                .find(|m| m.eq_ignore_ascii_case(&ui.model))
+                .unwrap_or(&ui.models[0]);
+            if ui.models.len() > 1 {
+                format!("{cur}   (click to change)")
+            } else {
+                cur.clone()
+            }
+        };
+        let mw = wide(&model);
+        let _ = SetWindowTextW(ui.ctl[&B_MODEL], PCWSTR(mw.as_ptr()));
     });
 }
 
@@ -888,6 +947,7 @@ fn episode_job(
                 .ok_or("episode is gone")?;
             (sh.settings.clone(), sh.paths.root.clone(), ep)
         };
+        let settings = podcast_trim::tools::resolve(&settings, &podcast_trim::tools::exe_dir())?;
         let paths = Paths::new(root);
         let res = work(&settings, &paths, &mut ep);
         let mut sh = shared.lock().unwrap();
@@ -1031,6 +1091,7 @@ fn on_command(id: i32, code: u32) {
                             &cuts,
                             ep.record.duration,
                             settings.bitrate_k,
+                            settings.mono,
                         );
                         let mut t = format!(
                             "{} cut(s), {} removed:\n",
@@ -1046,7 +1107,7 @@ fn on_command(id: i32, code: u32) {
                             ));
                         }
                         t.push_str("\nffmpeg command the app will run:\n");
-                        t.push_str(&ffargs::display(&settings.ffmpeg, &args));
+                        t.push_str(&ffargs::display("ffmpeg.exe", &args));
                         t.push_str("\n\nPress Approve and cut to go ahead.");
                         set_text(ui.ctl[&ID_VIEW], &t);
                         ui.pending = Some((show.unwrap(), ep.guid.clone(), cuts));
@@ -1127,6 +1188,23 @@ fn on_command(id: i32, code: u32) {
         }
         B_OPTIONS => set_page(true),
         B_BACK => set_page(false),
+        B_MONO => {
+            with(|ui| ui.mono_on = !ui.mono_on);
+            update_buttons();
+        }
+        B_MODEL => {
+            with(|ui| {
+                ui.models = podcast_trim::tools::models(&podcast_trim::tools::exe_dir());
+                if !ui.models.is_empty() {
+                    let i = ui
+                        .models
+                        .iter()
+                        .position(|m| m.eq_ignore_ascii_case(&ui.model));
+                    ui.model = ui.models[i.map(|i| (i + 1) % ui.models.len()).unwrap_or(0)].clone();
+                }
+            });
+            update_buttons();
+        }
         B_TOKEN => {
             with(|ui| ui.token_on = !ui.token_on);
             update_buttons();
@@ -1139,21 +1217,19 @@ fn on_command(id: i32, code: u32) {
                 let mut sh = ui.shared.lock().unwrap();
                 let old_bind = (sh.settings.bind.clone(), sh.settings.port);
                 let s = &mut sh.settings;
-                s.ffmpeg = v[0].clone();
-                s.ffprobe = v[1].clone();
-                s.whisper_cli = v[2].clone();
-                s.whisper_model = v[3].clone();
-                s.threads = v[4].parse().unwrap_or(s.threads);
-                s.language = v[5].clone();
-                s.bind = v[6].clone();
-                s.port = v[7].parse().unwrap_or(s.port);
-                s.public_host = v[8].clone();
-                s.bitrate_k = v[9]
+                s.whisper_model = ui.model.clone();
+                s.mono = ui.mono_on;
+                s.threads = v[0].parse().unwrap_or(s.threads);
+                s.language = v[1].clone();
+                s.bind = v[2].clone();
+                s.port = v[3].parse().unwrap_or(s.port);
+                s.public_host = v[4].clone();
+                s.bitrate_k = v[5]
                     .parse::<u32>()
                     .ok()
-                    .filter(|b| (32..=320).contains(b))
+                    .filter(|b| (6..=256).contains(b))
                     .unwrap_or(s.bitrate_k);
-                s.export_dir = v[10].clone();
+                s.export_dir = v[6].clone();
                 s.require_token = ui.token_on;
                 let restart = old_bind != (s.bind.clone(), s.port);
                 let r = save_json(&sh.paths.settings(), &sh.settings);
@@ -1254,8 +1330,21 @@ unsafe fn paint(hwnd: HWND) {
             false,
         );
         if ui.options {
+            let mut r0 = RECT {
+                left: scale(16, ui.dpi),
+                top: scale(80, ui.dpi),
+                right: scale(210, ui.dpi),
+                bottom: scale(100, ui.dpi),
+            };
+            text(
+                dc,
+                "WHISPER MODEL",
+                &mut r0,
+                TAN,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
             for (i, l) in OPTION_LABELS.iter().enumerate() {
-                let y = 80 + i as i32 * 34;
+                let y = 80 + (i as i32 + 1) * 34;
                 let mut r = RECT {
                     left: scale(16, ui.dpi),
                     top: scale(y, ui.dpi),
@@ -1290,12 +1379,12 @@ unsafe fn paint(hwnd: HWND) {
             }
             let mut r = RECT {
                 left: scale(16, ui.dpi),
-                top: scale(80 + 12 * 34, ui.dpi),
+                top: scale(80 + 10 * 34, ui.dpi),
                 right: rc.right - 16,
-                bottom: scale(80 + 12 * 34 + 60, ui.dpi),
+                bottom: scale(80 + 10 * 34 + 80, ui.dpi),
             };
             let addr = format!(
-                "Whisper runs on the CPU through whisper.cpp; point the fields above at whisper-cli.exe and a ggml model file.\nThe feed server is listening on {}. Use 0.0.0.0 to reach it from your phone on the same network, or 127.0.0.1 for this PC only.",
+                "ffmpeg.exe, ffprobe.exe, whisper-cli.exe with its DLLs, and ggml-*.bin models must be in the same folder as Podcast Trim.exe.\nThe feed server is listening on {}. Use 0.0.0.0 to reach it from your phone on the same network, or 127.0.0.1 for this PC only.",
                 ui.server_addr
             );
             text(dc, &addr, &mut r, DIM, DT_LEFT);
@@ -1382,7 +1471,7 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
             tr.left += 2;
             tr.top += 2;
         }
-        let is_check = dis.CtlID as i32 == B_TOKEN;
+        let is_check = matches!(dis.CtlID as i32, B_TOKEN | B_MONO);
         if is_check {
             tr.left += 8;
         }

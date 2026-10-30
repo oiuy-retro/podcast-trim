@@ -1,6 +1,7 @@
-//! Opt-in end-to-end run with the real companion tools. Skipped unless these
-//! are set: PT_FFMPEG, PT_FFPROBE, PT_WHISPER, PT_MODEL, PT_SAMPLE (a short
-//! speech clip, e.g. whisper.cpp's samples/jfk.wav).
+//! Opt-in end-to-end run with the real companion tools. Skipped unless
+//! PT_TOOLS_DIR (a folder laid out like the app folder: ffmpeg.exe,
+//! ffprobe.exe, whisper-cli.exe and its DLLs, a ggml-*.bin model) and
+//! PT_SAMPLE (a short speech clip, e.g. whisper.cpp's samples/jfk.mp3) are set.
 
 use podcast_trim::pipeline::{self, Env};
 use podcast_trim::store::{Episode, Paths, Settings, State};
@@ -30,28 +31,22 @@ impl Env for Real {
 
 #[test]
 fn real_tools() {
-    let var = |k: &str| std::env::var(k).ok();
-    let (Some(ff), Some(fp), Some(wh), Some(model), Some(sample)) = (
-        var("PT_FFMPEG"),
-        var("PT_FFPROBE"),
-        var("PT_WHISPER"),
-        var("PT_MODEL"),
-        var("PT_SAMPLE"),
-    ) else {
-        eprintln!("skipped: PT_* not set");
+    let (Ok(dir), Ok(sample)) = (std::env::var("PT_TOOLS_DIR"), std::env::var("PT_SAMPLE")) else {
+        eprintln!("skipped: PT_TOOLS_DIR / PT_SAMPLE not set");
         return;
     };
     let root = std::env::temp_dir().join(format!("pt-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let paths = Paths::new(root.clone());
-    let s = Settings {
-        ffmpeg: ff,
-        ffprobe: fp,
-        whisper_cli: wh,
-        whisper_model: model,
-        threads: 4,
-        ..Default::default()
-    };
+    let s = podcast_trim::tools::resolve(
+        &Settings {
+            threads: 4,
+            mono: true,
+            ..Default::default()
+        },
+        Path::new(&dir),
+    )
+    .unwrap();
     let env = Real { sample };
     let mut ep = Episode {
         guid: "e2e".into(),
@@ -77,6 +72,7 @@ fn real_tools() {
         .unwrap();
     println!("cleaned duration {d}");
     assert!((d - (ep.record.duration - 2.0)).abs() < 0.2);
+    assert_eq!(&std::fs::read(&out).unwrap()[..4], b"OggS");
     pipeline::mark_delivered(&paths, 1, &mut ep);
     pipeline::regenerate(&env, &s, &paths, 1, &mut ep).unwrap();
     assert!(paths.cleaned(1, &ep).exists());

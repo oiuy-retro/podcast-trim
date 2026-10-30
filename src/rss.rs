@@ -169,7 +169,7 @@ pub fn generate(show_title: &str, link: &str, items: &[OutItem]) -> String {
             escape(&it.description)
         ));
         x.push_str(&format!(
-            "<enclosure url=\"{}\" length=\"{}\" type=\"audio/mpeg\"/>\n",
+            "<enclosure url=\"{}\" length=\"{}\" type=\"audio/ogg\"/>\n",
             escape(&it.url),
             it.length
         ));
@@ -214,15 +214,15 @@ mod tests {
                 guid: "g".into(),
                 title: "T & U".into(),
                 pub_date: "d".into(),
-                url: "http://h/media/1/2.mp3?token=abc&x=1".into(),
+                url: "http://h/media/1/2.opus?token=abc&x=1".into(),
                 length: 99,
                 description: "Removed 1:00".into(),
             }],
         );
         assert!(xml.contains("<title>A &lt;b&gt; &amp; &quot;c&quot; (trimmed)</title>"));
-        assert!(xml.contains("length=\"99\" type=\"audio/mpeg\""));
+        assert!(xml.contains("length=\"99\" type=\"audio/ogg\""));
         let back = parse(&xml).unwrap();
-        assert_eq!(back.items[0].url, "http://h/media/1/2.mp3?token=abc&x=1");
+        assert_eq!(back.items[0].url, "http://h/media/1/2.opus?token=abc&x=1");
         assert_eq!(back.items[0].title, "T & U");
     }
 }

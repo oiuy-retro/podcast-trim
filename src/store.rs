@@ -10,9 +10,14 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Tool paths are filled in at run time from the exe folder (see tools.rs).
+    #[serde(skip)]
     pub ffmpeg: String,
+    #[serde(skip)]
     pub ffprobe: String,
+    #[serde(skip)]
     pub whisper_cli: String,
+    /// File name of the chosen ggml model in the exe folder.
     pub whisper_model: String,
     pub threads: u32,
     pub language: String,
@@ -21,7 +26,10 @@ pub struct Settings {
     /// Address the phone uses to reach this PC; written into feed links.
     pub public_host: String,
     pub require_token: bool,
+    /// Opus bitrate in kbit/s.
     pub bitrate_k: u32,
+    /// Downmix trimmed episodes to mono.
+    pub mono: bool,
     pub export_dir: String,
 }
 
@@ -40,7 +48,8 @@ impl Default for Settings {
             port: 8737,
             public_host: String::new(),
             require_token: true,
-            bitrate_k: 128,
+            bitrate_k: 64,
+            mono: false,
             export_dir: String::new(),
         }
     }
@@ -203,7 +212,7 @@ impl Paths {
         self.show_dir(show).join(format!("{}.orig", ep.key()))
     }
     pub fn cleaned(&self, show: u32, ep: &Episode) -> PathBuf {
-        self.show_dir(show).join(format!("{}.mp3", ep.key()))
+        self.show_dir(show).join(format!("{}.opus", ep.key()))
     }
     pub fn work(&self, show: u32, ep: &Episode, ext: &str) -> PathBuf {
         self.show_dir(show).join(format!("{}.{ext}", ep.key()))
@@ -262,6 +271,6 @@ mod tests {
         let back: Library = load_json(&p);
         assert_eq!(back.show(2).unwrap().title, "B");
         let s: Settings = serde_json::from_str("{\"port\":1}").unwrap();
-        assert_eq!((s.port, s.bitrate_k), (1, 128));
+        assert_eq!((s.port, s.bitrate_k, s.mono), (1, 64, false));
     }
 }

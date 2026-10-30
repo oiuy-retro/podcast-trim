@@ -121,7 +121,7 @@ pub fn apply_cuts(
 ) -> Result<(), String> {
     let orig = paths.original(show, ep);
     let out = paths.cleaned(show, ep);
-    let args = ffargs::cut_args(&orig, &out, &cuts, ep.record.duration, s.bitrate_k);
+    let args = ffargs::cut_args(&orig, &out, &cuts, ep.record.duration, s.bitrate_k, s.mono);
     env.run(&s.ffmpeg, &args)?;
     ep.cleaned_bytes = fs::metadata(&out)
         .map_err(|e| format!("ffmpeg wrote no file: {e}"))?
@@ -197,7 +197,7 @@ pub fn export(
 ) -> Result<std::path::PathBuf, String> {
     let src = paths.cleaned(show, ep);
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let dest = dir.join(format!("{}.mp3", safe_name(&ep.title)));
+    let dest = dir.join(format!("{}.opus", safe_name(&ep.title)));
     fs::copy(&src, &dest).map_err(|e| format!("{}: {e}", src.display()))?;
     Ok(dest)
 }
@@ -287,7 +287,7 @@ mod tests {
         let first_args = ep.record.ffmpeg_args.clone();
 
         let out = export(&paths, 1, &ep, &paths.root.join("export")).unwrap();
-        assert!(out.ends_with("Ep_ 1_.mp3"));
+        assert!(out.ends_with("Ep_ 1_.opus"));
 
         mark_delivered(&paths, 1, &mut ep);
         assert_eq!(ep.state, State::Delivered);

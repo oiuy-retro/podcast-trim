@@ -14,13 +14,14 @@ fn num(x: f64) -> String {
 }
 
 /// ffmpeg args that keep everything except `cuts` (already validated) and
-/// encode MP3, which every podcast app plays.
+/// encode Ogg Opus (`.opus`), which is efficient for speech.
 pub fn cut_args(
     input: &Path,
     output: &Path,
     cuts: &[Cut],
     duration: f64,
     bitrate_k: u32,
+    mono: bool,
 ) -> Vec<String> {
     let keep = keep_segments(cuts, duration);
     let mut filter = String::new();
@@ -35,7 +36,7 @@ pub fn cut_args(
         filter.push_str(&format!("[k{i}]"));
     }
     filter.push_str(&format!("concat=n={}:v=0:a=1[out]", keep.len()));
-    vec![
+    let mut args: Vec<String> = vec![
         "-hide_banner".into(),
         "-nostdin".into(),
         "-y".into(),
@@ -48,11 +49,19 @@ pub fn cut_args(
         "-map_metadata".into(),
         "0".into(),
         "-c:a".into(),
-        "libmp3lame".into(),
+        "libopus".into(),
         "-b:a".into(),
         format!("{bitrate_k}k"),
-        s(output),
-    ]
+        "-vbr".into(),
+        "on".into(),
+        "-application".into(),
+        "audio".into(),
+    ];
+    if mono {
+        args.extend(["-ac".into(), "1".into()]);
+    }
+    args.extend(["-f".into(), "ogg".into(), s(output)]);
+    args
 }
 
 /// 16 kHz mono PCM WAV, the input whisper.cpp expects.
@@ -138,7 +147,7 @@ mod tests {
     fn cut_filter() {
         let a = cut_args(
             &PathBuf::from("in file.mp3"),
-            &PathBuf::from("out.mp3"),
+            &PathBuf::from("out.opus"),
             &[
                 Cut {
                     start: 0.0,
@@ -150,7 +159,8 @@ mod tests {
                 },
             ],
             200.0,
-            128,
+            64,
+            true,
         );
         assert_eq!(a[4], "in file.mp3");
         let f = &a[6];
@@ -159,13 +169,23 @@ mod tests {
             "[0:a]atrim=start=30.000:end=100.000,asetpts=PTS-STARTPTS[k0];\
              [0:a]atrim=start=130.500:end=200.000,asetpts=PTS-STARTPTS[k1];[k0][k1]concat=n=2:v=0:a=1[out]"
         );
-        assert_eq!(a.last().unwrap(), "out.mp3");
-        assert!(a.contains(&"128k".to_string()));
+        assert_eq!(a.last().unwrap(), "out.opus");
+        assert!(a.windows(2).any(|w| w[0] == "-c:a" && w[1] == "libopus"));
+        assert!(a.windows(2).any(|w| w[0] == "-ac" && w[1] == "1"));
+        assert!(a.windows(2).any(|w| w[0] == "-f" && w[1] == "ogg"));
+        assert!(a.contains(&"64k".to_string()));
     }
 
     #[test]
     fn no_cuts_is_one_segment() {
-        let a = cut_args(&PathBuf::from("i"), &PathBuf::from("o"), &[], 10.0, 96);
+        let a = cut_args(
+            &PathBuf::from("i"),
+            &PathBuf::from("o"),
+            &[],
+            10.0,
+            96,
+            false,
+        );
         assert!(a[6].ends_with("[k0]concat=n=1:v=0:a=1[out]"));
     }
 
