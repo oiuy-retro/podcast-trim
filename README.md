@@ -89,7 +89,7 @@ cargo clippy --all-targets
 
 ## Look
 
-The window copies the general look of late-1990s game menus: olive panels, khaki headings, 1-pixel light and dark bevels, and flat beveled buttons. It is drawn with plain Win32 and GDI. Text uses the Pixel Operator pixel font (CC0), embedded in the exe and drawn without smoothing. No game assets are included. Scroll bars are the standard Windows ones.
+The window copies the general look of late-1990s game dialogs: olive panels, light text with khaki for the active tab and checked options, a mustard selection bar, 1-pixel light and dark bevels, and the app's own caption bar, tabs, buttons, and scroll bars. It is drawn with plain Win32 and GDI. Text uses Tahoma, which ships with Windows, at 13 pixels without smoothing. No game assets are included.
 
 ## License
 

@@ -4,7 +4,7 @@ Podcast Trim links against or runs next to the following projects. This reposito
 
 Tested with FFmpeg `9.0.2-essentials_build` (Gyan) and whisper.cpp `b5454` (`whisper-bin-x64.zip`) with `ggml-tiny.en.bin`.
 
-## Linked or embedded in the exe
+## Rust crates (linked into the exe)
 
 | Project | License | Use |
 | --- | --- | --- |
@@ -12,7 +12,6 @@ Tested with FFmpeg `9.0.2-essentials_build` (Gyan) and whisper.cpp `b5454` (`whi
 | [serde](https://github.com/serde-rs/serde) | MIT OR Apache-2.0 | Settings and library files |
 | [serde_json](https://github.com/serde-rs/json) | MIT OR Apache-2.0 | JSON settings, library, and AI replies |
 | [sha2](https://github.com/RustCrypto/hashes) | MIT OR Apache-2.0 | SHA-256 of original downloads |
-| [Pixel Operator](https://notabug.org/HarvettFox96/ttf-pixeloperator) 2018.10.04-1 by Jayvee Enaguas | CC0 1.0 ([text](assets/fonts/LICENSE-PixelOperator-CC0.txt)) | UI font, `PixelOperator.ttf` and `PixelOperator-Bold.ttf` embedded in the exe |
 | [winres](https://github.com/mxre/winres) | MIT | Icon and manifest at build time |
 | [Rust](https://www.rust-lang.org/) / LLVM | MIT / Apache-2.0 / NCSA | Compiler |
 
@@ -28,7 +27,7 @@ FFmpeg is a trademark of Fabrice Bellard / the FFmpeg project.
 
 ## Windows
 
-Common Controls 6 and WinHTTP are part of Windows. This program uses them and does not redistribute Windows.
+Tahoma, Common Controls 6, and WinHTTP are part of Windows. This program uses them by name and does not redistribute Windows or its fonts.
 
 ## Style
 

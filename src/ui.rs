@@ -1,6 +1,7 @@
 //! Win32 window drawn in the style of GoldSource-era VGUI menus:
-//! olive panels, khaki text, 1px light/dark bevels, flat beveled buttons.
-//! Every button is owner-drawn; edits and lists are recoloured.
+//! olive panels, light text with khaki for the active tab and checked items,
+//! 1px light/dark bevels, flat beveled buttons, Tahoma 13 px without smoothing.
+//! The window draws its own caption, tabs, buttons, and scroll bars.
 
 use crate::net;
 use podcast_trim::cutlist::{format_time, removed_seconds, Cut};
@@ -20,8 +21,8 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
     FillRect, GetDC, GetDeviceCaps, InvalidateRect, LineTo, MoveToEx, ReleaseDC, SelectObject,
-    SetBkColor, SetBkMode, SetTextColor, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, HBRUSH, HDC, HFONT, LOGPIXELSX, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+    SetBkColor, SetBkMode, SetTextColor, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH,
+    HDC, HFONT, LOGPIXELSX, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -64,9 +65,11 @@ const B_APPROVE: i32 = 205;
 const B_REGEN: i32 = 206;
 const B_EXPORT: i32 = 207;
 const B_COPYFEED: i32 = 208;
-const B_OPTIONS: i32 = 209;
+const B_TAB_MAIN: i32 = 209;
 const B_SAVE: i32 = 210;
-const B_BACK: i32 = 211;
+const B_TAB_OPT: i32 = 211;
+const B_MIN: i32 = 215;
+const B_CLOSE: i32 = 216;
 const B_TOKEN: i32 = 212;
 const OPT_BASE: i32 = 300;
 
@@ -75,20 +78,19 @@ const B_MODEL: i32 = 214;
 
 /// Edit rows on the Options page; row 0 is the model picker button.
 const OPTION_LABELS: [&str; 7] = [
-    "CPU THREADS",
-    "LANGUAGE",
-    "LISTEN ADDRESS",
-    "PORT",
-    "PC ADDRESS FOR PHONE",
-    "OPUS BITRATE (KBPS)",
-    "EXPORT FOLDER",
+    "CPU threads",
+    "Language",
+    "Listen address",
+    "Port",
+    "PC address for phone",
+    "Opus bitrate (kbps)",
+    "Export folder",
 ];
 
 struct Ui {
     hwnd: HWND,
     shared: SharedRef,
     font: HFONT,
-    title_font: HFONT,
     brush_field: HBRUSH,
     brush_bg: HBRUSH,
     dpi: i32,
@@ -104,8 +106,18 @@ struct Ui {
     models: Vec<String>,
     model: String,
     server_addr: String,
-    frames: Vec<RECT>,
-    labels: Vec<(RECT, String, bool)>,
+    /// Bevelled frames: (rect, page, raised).
+    frames: Vec<(RECT, u8, bool)>,
+    labels: Vec<(RECT, String, u8, LabelKind)>,
+    /// Every top-level child and the page it belongs to.
+    pages: Vec<(HWND, u8)>,
+    icon: HICON,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum LabelKind {
+    Plain,
+    Header,
 }
 
 static BRUSH_BG: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
@@ -197,25 +209,7 @@ fn scale(v: i32, dpi: i32) -> i32 {
     v * dpi / 96
 }
 
-static PIXEL_REGULAR: &[u8] = include_bytes!("../assets/fonts/PixelOperator.ttf");
-static PIXEL_BOLD: &[u8] = include_bytes!("../assets/fonts/PixelOperator-Bold.ttf");
-
-/// Register the embedded Pixel Operator fonts for this process only.
-fn load_fonts() {
-    for data in [PIXEL_REGULAR, PIXEL_BOLD] {
-        let mut count = 0u32;
-        unsafe {
-            windows::Win32::Graphics::Gdi::AddFontMemResourceEx(
-                data.as_ptr() as *const core::ffi::c_void,
-                data.len() as u32,
-                None,
-                std::ptr::addr_of_mut!(count) as *const u32,
-            );
-        }
-    }
-}
-
-/// Pixel Operator is drawn on a 16 px grid; use multiples of it, unsmoothed.
+/// Tahoma, 13 px, no smoothing: what the GoldSource VGUI dialogs use.
 fn make_font(px: i32, bold: bool) -> HFONT {
     unsafe {
         CreateFontW(
@@ -232,7 +226,7 @@ fn make_font(px: i32, bold: bool) -> HFONT {
             0,
             3,
             0,
-            w!("Pixel Operator"),
+            w!("Tahoma"),
         )
     }
 }
@@ -289,27 +283,44 @@ pub fn run() -> i32 {
             ..Default::default()
         };
         RegisterClassW(&class);
-        load_fonts();
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(clip_proc),
+            hInstance: instance,
+            lpszClassName: w!("PodcastTrimClip"),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            ..Default::default()
+        });
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(scroll_proc),
+            hInstance: instance,
+            lpszClassName: w!("PodcastTrimScroll"),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            ..Default::default()
+        });
         let dc = GetDC(None);
         let dpi = GetDeviceCaps(dc, LOGPIXELSX).max(96);
         ReleaseDC(None, dc);
         DPI.store(dpi, std::sync::atomic::Ordering::Relaxed);
-        let (w, h) = (scale(980, dpi), scale(660, dpi));
-        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-        let mut r = RECT {
+        let (w, h) = (scale(WIN_W, dpi), scale(WIN_H, dpi));
+        // Borderless: the app draws its own VGUI-style caption and frame.
+        let style = WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
+        let r = RECT {
             left: 0,
             top: 0,
             right: w,
             bottom: h,
         };
-        let _ = AdjustWindowRect(&mut r, style, false);
+        let (sx, sy) = (
+            (GetSystemMetrics(SM_CXSCREEN) - w) / 2,
+            (GetSystemMetrics(SM_CYSCREEN) - h) / 2,
+        );
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("PodcastTrimWindow"),
             w!("Podcast Trim"),
             style,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            sx.max(0),
+            sy.max(0),
             r.right - r.left,
             r.bottom - r.top,
             None,
@@ -324,8 +335,7 @@ pub fn run() -> i32 {
         let ui = Ui {
             hwnd,
             shared: shared.clone(),
-            font: make_font(16 * (dpi / 96).max(1), false),
-            title_font: make_font(32 * (dpi / 96).max(1), true),
+            font: make_font(scale(13, dpi), false),
             brush_field: CreateSolidBrush(COLORREF(FIELD)),
             brush_bg: CreateSolidBrush(COLORREF(BG)),
             dpi,
@@ -342,6 +352,17 @@ pub fn run() -> i32 {
             server_addr: String::new(),
             frames: vec![],
             labels: vec![],
+            pages: vec![],
+            icon: LoadImageW(
+                instance,
+                PCWSTR(1 as _),
+                IMAGE_ICON,
+                16,
+                16,
+                LR_DEFAULTCOLOR,
+            )
+            .map(|h| HICON(h.0))
+            .unwrap_or_default(),
         };
         BRUSH_BG.store(ui.brush_bg.0 as isize, std::sync::atomic::Ordering::Relaxed);
         BRUSH_FIELD.store(
@@ -389,13 +410,16 @@ fn status(ui: &Ui, msg: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn child(
     ui: &mut Ui,
     instance: HINSTANCE,
+    parent: HWND,
     class: PCWSTR,
     text: &str,
     style: u32,
     id: i32,
+    page: u8,
     r: (i32, i32, i32, i32),
 ) -> HWND {
     let d = ui.dpi;
@@ -409,7 +433,7 @@ unsafe fn child(
         scale(r.1, d),
         scale(r.2, d),
         scale(r.3, d),
-        ui.hwnd,
+        parent,
         HMENU(id as _),
         instance,
         None,
@@ -417,31 +441,8 @@ unsafe fn child(
     .unwrap_or_default();
     SendMessageW(h, WM_SETFONT, WPARAM(ui.font.0 as usize), LPARAM(1));
     ui.ctl.insert(id, h);
+    ui.pages.push((h, page));
     h
-}
-
-fn frame(ui: &mut Ui, r: (i32, i32, i32, i32)) {
-    let d = ui.dpi;
-    ui.frames.push(RECT {
-        left: scale(r.0, d) - 1,
-        top: scale(r.1, d) - 1,
-        right: scale(r.0 + r.2, d) + 1,
-        bottom: scale(r.1 + r.3, d) + 1,
-    });
-}
-
-fn label(ui: &mut Ui, text: &str, x: i32, y: i32, w: i32, tan: bool) {
-    let d = ui.dpi;
-    ui.labels.push((
-        RECT {
-            left: scale(x, d),
-            top: scale(y, d),
-            right: scale(x + w, d),
-            bottom: scale(y + 16, d),
-        },
-        text.into(),
-        tan,
-    ));
 }
 
 const BTN: u32 = BS_OWNERDRAW as u32 | WS_TABSTOP.0;
@@ -455,149 +456,318 @@ const LIST: u32 = LBS_NOTIFY as u32
     | LBS_OWNERDRAWFIXED as u32
     | LBS_HASSTRINGS as u32
     | LBS_NOINTEGRALHEIGHT as u32
+    | LBS_DISABLENOSCROLL as u32
     | WS_VSCROLL.0
     | WS_TABSTOP.0;
 
+const PAGE_ALL: u8 = 0;
+const PAGE_MAIN: u8 = 1;
+const PAGE_OPT: u8 = 2;
+
+/// Window size in 96-DPI pixels.
+const WIN_W: i32 = 900;
+const WIN_H: i32 = 600;
+const CAPTION_H: i32 = 26;
+const SB_W: i32 = 17;
+
+fn sr(ui: &Ui, x: i32, y: i32, w: i32, h: i32) -> RECT {
+    let d = ui.dpi;
+    RECT {
+        left: scale(x, d),
+        top: scale(y, d),
+        right: scale(x + w, d),
+        bottom: scale(y + h, d),
+    }
+}
+
+/// A plain sunken field (single-line edit) with its frame.
+fn field(
+    ui: &mut Ui,
+    instance: HINSTANCE,
+    style: u32,
+    id: i32,
+    page: u8,
+    r: (i32, i32, i32, i32),
+) -> HWND {
+    let fr = sr(ui, r.0, r.1, r.2, r.3);
+    ui.frames.push((fr, page, false));
+    unsafe {
+        child(
+            ui,
+            instance,
+            ui.hwnd,
+            w!("EDIT"),
+            "",
+            style,
+            id,
+            page,
+            (r.0 + 4, r.1 + 3, r.2 - 6, r.3 - 5),
+        )
+    }
+}
+
+/// A sunken box holding a list or multi-line edit, an optional raised column
+/// header, and a themed scroll bar. The control's own scroll bar is pushed
+/// outside a clipping parent so only ours shows.
+#[allow(clippy::too_many_arguments)]
+fn boxed(
+    ui: &mut Ui,
+    instance: HINSTANCE,
+    class: PCWSTR,
+    style: u32,
+    id: i32,
+    page: u8,
+    header: Option<&str>,
+    r: (i32, i32, i32, i32),
+) {
+    let d = ui.dpi;
+    let fr = sr(ui, r.0, r.1, r.2, r.3);
+    ui.frames.push((fr, page, false));
+    let (ix, iy, iw, ih) = (r.0 + 1, r.1 + 1, r.2 - 2, r.3 - 2);
+    let hh = if header.is_some() { 20 } else { 0 };
+    if let Some(h) = header {
+        ui.labels.push((
+            sr(ui, ix, iy, iw - SB_W, hh),
+            h.to_string(),
+            page,
+            LabelKind::Header,
+        ));
+    }
+    let pad = if class == w!("EDIT") { 3 } else { 0 };
+    unsafe {
+        let clip = CreateWindowExW(
+            WS_EX_CONTROLPARENT,
+            w!("PodcastTrimClip"),
+            None,
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+            scale(ix, d),
+            scale(iy + hh, d),
+            scale(iw - SB_W, d),
+            scale(ih - hh, d),
+            ui.hwnd,
+            None,
+            instance,
+            None,
+        )
+        .unwrap_or_default();
+        ui.pages.push((clip, page));
+        let t = wide("");
+        let ctl = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class,
+            PCWSTR(t.as_ptr()),
+            WINDOW_STYLE(style) | WS_CHILD | WS_VISIBLE,
+            scale(pad, d),
+            scale(pad, d),
+            scale(iw - SB_W - pad, d) + GetSystemMetrics(SM_CXVSCROLL),
+            scale(ih - hh - pad, d),
+            clip,
+            HMENU(id as _),
+            instance,
+            None,
+        )
+        .unwrap_or_default();
+        SendMessageW(ctl, WM_SETFONT, WPARAM(ui.font.0 as usize), LPARAM(1));
+        ui.ctl.insert(id, ctl);
+        let sb = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("PodcastTrimScroll"),
+            None,
+            WS_CHILD | WS_VISIBLE,
+            scale(ix + iw - SB_W, d),
+            scale(iy, d),
+            scale(SB_W, d),
+            scale(ih, d),
+            ui.hwnd,
+            None,
+            instance,
+            None,
+        )
+        .unwrap_or_default();
+        SetWindowLongPtrW(sb, GWLP_USERDATA, ctl.0 as isize);
+        SetTimer(sb, 1, 120, None);
+        ui.pages.push((sb, page));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn button(ui: &mut Ui, instance: HINSTANCE, text: &str, id: i32, page: u8, x: i32, y: i32, w: i32) {
+    unsafe {
+        child(
+            ui,
+            instance,
+            ui.hwnd,
+            w!("BUTTON"),
+            text,
+            BTN,
+            id,
+            page,
+            (x, y, w, 24),
+        );
+    }
+}
+
+fn label(ui: &mut Ui, text: &str, page: u8, x: i32, y: i32, w: i32) {
+    let r = sr(ui, x, y, w, 16);
+    ui.labels.push((r, text.into(), page, LabelKind::Plain));
+}
+
 fn build_controls(instance: HINSTANCE) {
     with(|ui| unsafe {
-        let (l, bt) = (w!("LISTBOX"), w!("BUTTON"));
-        let e = w!("EDIT");
-        // Main page
-        label(ui, "SHOWS", 16, 52, 280, true);
-        child(ui, instance, l, "", LIST, ID_SHOWS, (16, 72, 280, 330));
-        frame(ui, (16, 72, 280, 330));
-        label(ui, "SHOW RSS LINK", 16, 412, 280, false);
-        child(ui, instance, e, "", EDIT, ID_URL, (16, 432, 280, 20));
-        frame(ui, (16, 432, 280, 20));
-        child(ui, instance, bt, "Add show", BTN, B_ADD, (16, 462, 136, 24));
+        let (l, e) = (w!("LISTBOX"), w!("EDIT"));
+        let bt = w!("BUTTON");
+        // Caption buttons and tabs
         child(
             ui,
             instance,
+            ui.hwnd,
             bt,
-            "Check for new",
-            BTN,
-            B_REFRESH,
-            (160, 462, 136, 24),
-        );
-
-        label(ui, "EPISODES", 312, 52, 300, true);
-        child(ui, instance, l, "", LIST, ID_EPS, (312, 72, 320, 330));
-        frame(ui, (312, 72, 320, 330));
-        child(
-            ui,
-            instance,
-            bt,
-            "Download + transcribe",
-            BTN,
-            B_PROCESS,
-            (312, 412, 158, 24),
-        );
-        child(
-            ui,
-            instance,
-            bt,
-            "Copy AI prompt",
-            BTN,
-            B_PROMPT,
-            (474, 412, 158, 24),
-        );
-        child(
-            ui,
-            instance,
-            bt,
-            "Regenerate",
-            BTN,
-            B_REGEN,
-            (312, 442, 158, 24),
-        );
-        child(
-            ui,
-            instance,
-            bt,
-            "Export Opus...",
-            BTN,
-            B_EXPORT,
-            (474, 442, 158, 24),
-        );
-
-        label(ui, "DETAILS", 648, 52, 316, true);
-        child(
-            ui,
-            instance,
-            e,
             "",
-            MEMO | ES_READONLY as u32,
-            ID_VIEW,
-            (648, 72, 316, 210),
+            BS_OWNERDRAW as u32,
+            B_MIN,
+            PAGE_ALL,
+            (WIN_W - 48, 5, 18, 17),
         );
-        frame(ui, (648, 72, 316, 210));
-        label(ui, "PASTE THE AI'S REPLY", 648, 292, 316, false);
-        child(ui, instance, e, "", MEMO, ID_REPLY, (648, 312, 316, 90));
-        frame(ui, (648, 312, 316, 90));
         child(
             ui,
             instance,
+            ui.hwnd,
             bt,
-            "Check cuts",
-            BTN,
-            B_CHECK,
-            (648, 412, 156, 24),
-        );
-        child(
-            ui,
-            instance,
-            bt,
-            "Approve and cut",
-            BTN,
-            B_APPROVE,
-            (808, 412, 156, 24),
-        );
-
-        label(ui, "FEED LINK FOR YOUR PODCAST APP", 16, 504, 400, true);
-        child(
-            ui,
-            instance,
-            e,
             "",
-            EDIT | ES_READONLY as u32,
-            ID_FEED,
-            (16, 524, 780, 20),
+            BS_OWNERDRAW as u32,
+            B_CLOSE,
+            PAGE_ALL,
+            (WIN_W - 26, 5, 18, 17),
         );
-        frame(ui, (16, 524, 780, 20));
         child(
             ui,
             instance,
+            ui.hwnd,
             bt,
-            "Copy feed link",
-            BTN,
-            B_COPYFEED,
-            (808, 522, 156, 24),
+            "Episodes",
+            BS_OWNERDRAW as u32,
+            B_TAB_MAIN,
+            PAGE_ALL,
+            (14, 32, 80, 21),
         );
         child(
             ui,
             instance,
+            ui.hwnd,
             bt,
             "Options",
-            BTN,
-            B_OPTIONS,
-            (808, 616, 156, 28),
+            BS_OWNERDRAW as u32,
+            B_TAB_OPT,
+            PAGE_ALL,
+            (96, 32, 76, 21),
         );
+
+        // Episodes page
+        let m = PAGE_MAIN;
+        boxed(
+            ui,
+            instance,
+            l,
+            LIST,
+            ID_SHOWS,
+            m,
+            Some("Show"),
+            (24, 68, 264, 296),
+        );
+        label(ui, "Show RSS link", m, 24, 374, 264);
+        field(ui, instance, EDIT, ID_URL, m, (24, 392, 264, 22));
+        button(ui, instance, "Add show", B_ADD, m, 24, 422, 90);
+        button(ui, instance, "Check for new", B_REFRESH, m, 120, 422, 110);
+
+        boxed(
+            ui,
+            instance,
+            l,
+            LIST,
+            ID_EPS,
+            m,
+            Some("Episode"),
+            (300, 68, 296, 296),
+        );
+        button(
+            ui,
+            instance,
+            "Download + transcribe",
+            B_PROCESS,
+            m,
+            300,
+            374,
+            150,
+        );
+        button(ui, instance, "Copy AI prompt", B_PROMPT, m, 456, 374, 120);
+        button(ui, instance, "Regenerate", B_REGEN, m, 300, 404, 100);
+        button(ui, instance, "Export Opus...", B_EXPORT, m, 406, 404, 110);
+
+        boxed(
+            ui,
+            instance,
+            e,
+            MEMO | ES_READONLY as u32,
+            ID_VIEW,
+            m,
+            Some("Details"),
+            (608, 68, 268, 196),
+        );
+        label(ui, "Paste the AI's reply", m, 608, 274, 268);
+        boxed(
+            ui,
+            instance,
+            e,
+            MEMO,
+            ID_REPLY,
+            m,
+            None,
+            (608, 292, 268, 72),
+        );
+        button(ui, instance, "Check cuts", B_CHECK, m, 608, 374, 96);
+        button(ui, instance, "Approve and cut", B_APPROVE, m, 710, 374, 120);
+
+        label(ui, "Feed link for your podcast app", m, 24, 462, 400);
+        field(
+            ui,
+            instance,
+            EDIT | ES_READONLY as u32,
+            ID_FEED,
+            m,
+            (24, 480, 730, 22),
+        );
+        button(ui, instance, "Copy feed link", B_COPYFEED, m, 766, 479, 110);
         child(
             ui,
             instance,
+            ui.hwnd,
             w!("STATIC"),
             "",
             0x0C | 0x80,
             ID_STATUS,
-            (16, 566, 948, 40),
+            PAGE_ALL,
+            (24, 518, 852, 34),
         );
         STATUS.store(
             ui.ctl[&ID_STATUS].0 as isize,
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        // Options page (hidden until opened)
+        // Options page
+        let o = PAGE_OPT;
         let s = ui.shared.lock().unwrap().settings.clone();
+        label(ui, "Whisper model", o, 28, 76, 180);
+        child(
+            ui,
+            instance,
+            ui.hwnd,
+            bt,
+            "",
+            BTN,
+            B_MODEL,
+            o,
+            (220, 72, 420, 22),
+        );
         let vals = [
             s.threads.to_string(),
             s.language,
@@ -608,73 +778,55 @@ fn build_controls(instance: HINSTANCE) {
             s.export_dir,
         ];
         for (i, v) in vals.iter().enumerate() {
-            let y = 80 + (i as i32 + 1) * 34;
-            let h = child(
+            let y = 72 + (i as i32 + 1) * 32;
+            label(ui, OPTION_LABELS[i], o, 28, y + 4, 180);
+            let h = field(
                 ui,
                 instance,
-                e,
-                v,
                 EDIT,
                 OPT_BASE + i as i32,
-                (220, y, 600, 20),
+                o,
+                (220, y, 420, 22),
             );
-            let _ = ShowWindow(h, SW_HIDE);
+            set_text(h, v);
         }
-        let h = child(
+        child(
             ui,
             instance,
+            ui.hwnd,
             bt,
-            "",
+            "Require feed token",
             BTN,
             B_TOKEN,
-            (220, 80 + 9 * 34, 260, 24),
+            o,
+            (220, 340, 200, 20),
         );
-        let _ = ShowWindow(h, SW_HIDE);
-        let h = child(
+        child(
             ui,
             instance,
+            ui.hwnd,
             bt,
-            "",
+            "Mono",
             BTN,
             B_MONO,
-            (490, 80 + 9 * 34, 260, 24),
+            o,
+            (440, 340, 120, 20),
         );
-        let _ = ShowWindow(h, SW_HIDE);
-        let h = child(ui, instance, bt, "", BTN, B_MODEL, (220, 80, 600, 22));
-        let _ = ShowWindow(h, SW_HIDE);
-        for id in [B_SAVE, B_BACK] {
-            let (t, x) = if id == B_SAVE {
-                ("Save", 648)
-            } else {
-                ("Back", 808)
-            };
-            let h = child(ui, instance, bt, t, BTN, id, (x, 616, 156, 28));
-            let _ = ShowWindow(h, SW_HIDE);
-        }
+        button(ui, instance, "Save", B_SAVE, o, 796, 556, 80);
     });
+    set_page(false);
     update_buttons();
 }
-
-const MAIN_IDS: [i32; 20] = [
-    ID_SHOWS, ID_EPS, ID_URL, ID_VIEW, ID_REPLY, ID_FEED, B_ADD, B_REFRESH, B_PROCESS, B_PROMPT,
-    B_CHECK, B_APPROVE, B_REGEN, B_EXPORT, B_COPYFEED, B_OPTIONS, 0, 0, 0, 0,
-];
 
 fn set_page(options: bool) {
     with(|ui| unsafe {
         ui.options = options;
-        for id in MAIN_IDS.iter().filter(|i| **i != 0) {
-            let _ = ShowWindow(ui.ctl[id], if options { SW_HIDE } else { SW_SHOW });
+        for (h, p) in &ui.pages {
+            let show = *p == PAGE_ALL || (*p == PAGE_OPT) == options;
+            let _ = ShowWindow(*h, if show { SW_SHOW } else { SW_HIDE });
         }
-        for i in 0..OPTION_LABELS.len() as i32 {
-            let _ = ShowWindow(
-                ui.ctl[&(OPT_BASE + i)],
-                if options { SW_SHOW } else { SW_HIDE },
-            );
-        }
-        for id in [B_TOKEN, B_MONO, B_MODEL, B_SAVE, B_BACK] {
-            let _ = ShowWindow(ui.ctl[&id], if options { SW_SHOW } else { SW_HIDE });
-        }
+        let _ = InvalidateRect(ui.ctl[&B_TAB_MAIN], None, true);
+        let _ = InvalidateRect(ui.ctl[&B_TAB_OPT], None, true);
         let _ = InvalidateRect(ui.hwnd, None, true);
     });
 }
@@ -872,16 +1024,10 @@ fn update_buttons() {
         en(B_REGEN, idle && st == Some(State::Delivered));
         en(B_EXPORT, idle && st == Some(State::Ready));
         en(B_COPYFEED, show.is_some());
-        let _ = SetWindowTextW(
-            ui.ctl[&B_TOKEN],
-            if ui.token_on {
-                w!("[X] Require feed token")
-            } else {
-                w!("[  ] Require feed token")
-            },
-        );
-        let mono = wide(if ui.mono_on { "[X] Mono" } else { "[  ] Mono" });
-        let _ = SetWindowTextW(ui.ctl[&B_MONO], PCWSTR(mono.as_ptr()));
+        SetWindowLongPtrW(ui.ctl[&B_TOKEN], GWLP_USERDATA, ui.token_on as isize);
+        SetWindowLongPtrW(ui.ctl[&B_MONO], GWLP_USERDATA, ui.mono_on as isize);
+        let _ = InvalidateRect(ui.ctl[&B_TOKEN], None, false);
+        let _ = InvalidateRect(ui.ctl[&B_MONO], None, false);
         let model = if ui.models.is_empty() {
             "No ggml-*.bin model next to Podcast Trim.exe".to_string()
         } else {
@@ -891,7 +1037,7 @@ fn update_buttons() {
                 .find(|m| m.eq_ignore_ascii_case(&ui.model))
                 .unwrap_or(&ui.models[0]);
             if ui.models.len() > 1 {
-                format!("{cur}   (click to change)")
+                format!("{cur}  ({} found, click to switch)", ui.models.len())
             } else {
                 cur.clone()
             }
@@ -1186,8 +1332,14 @@ fn on_command(id: i32, code: u32) {
                 status(ui, "Feed link copied. Replace <this-pc-address> with this PC's address if shown, or set it in Options.");
             });
         }
-        B_OPTIONS => set_page(true),
-        B_BACK => set_page(false),
+        B_TAB_OPT => set_page(true),
+        B_TAB_MAIN => set_page(false),
+        B_MIN => unsafe {
+            let _ = ShowWindow(hwnd, SW_MINIMIZE);
+        },
+        B_CLOSE => unsafe {
+            let _ = DestroyWindow(hwnd);
+        },
         B_MONO => {
             with(|ui| ui.mono_on = !ui.mono_on);
             update_buttons();
@@ -1284,6 +1436,26 @@ unsafe fn text(
     DrawTextW(dc, &mut w, r, flags | DT_NOPREFIX);
 }
 
+unsafe fn fill(dc: HDC, r: &RECT, color: u32) {
+    let b = CreateSolidBrush(COLORREF(color));
+    FillRect(dc, r, b);
+    let _ = DeleteObject(b);
+}
+
+/// Small solid triangle, pointing up or down, centred in `r`.
+unsafe fn arrow(dc: HDC, r: &RECT, up: bool, color: u32) {
+    let cx = (r.left + r.right) / 2;
+    let cy = (r.top + r.bottom) / 2;
+    let pen = CreatePen(PS_SOLID, 1, COLORREF(color));
+    let old = SelectObject(dc, pen);
+    for i in 0..4 {
+        let y = if up { cy - 2 + i } else { cy + 1 - i };
+        line(dc, cx - i, y, cx + i + 1, y);
+    }
+    SelectObject(dc, old);
+    let _ = DeleteObject(pen);
+}
+
 unsafe fn paint(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
     let dc = BeginPaint(hwnd, &mut ps);
@@ -1291,117 +1463,64 @@ unsafe fn paint(hwnd: HWND) {
         let mut rc = RECT::default();
         let _ = GetClientRect(hwnd, &mut rc);
         FillRect(dc, &rc, ui.brush_bg);
-        // Outer window bevel and title strip, like a VGUI frame.
-        let inner = RECT {
-            left: rc.left + 4,
-            top: rc.top + 4,
-            right: rc.right - 4,
-            bottom: rc.bottom - 4,
-        };
-        bevel(dc, &inner, true);
-        let old = SelectObject(dc, ui.title_font);
-        let mut tr = RECT {
-            left: scale(16, ui.dpi),
-            top: scale(14, ui.dpi),
-            right: rc.right - 16,
-            bottom: scale(42, ui.dpi),
-        };
+        // Window frame: light top/left, dark bottom/right.
+        bevel(dc, &rc, true);
+        let old = SelectObject(dc, ui.font);
+        // Caption: icon and title on the same olive as the body.
+        let d = ui.dpi;
+        let _ = DrawIconEx(
+            dc,
+            scale(8, d),
+            scale(5, d),
+            ui.icon,
+            scale(16, d),
+            scale(16, d),
+            0,
+            None,
+            DI_NORMAL,
+        );
+        let mut tr = sr(ui, 30, 2, 400, CAPTION_H - 2);
         text(
             dc,
-            if ui.options {
-                "PODCAST TRIM  -  OPTIONS"
-            } else {
-                "PODCAST TRIM"
-            },
+            "Podcast Trim",
             &mut tr,
             TEXT,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER,
         );
-        SelectObject(dc, ui.font);
-        let sep = scale(44, ui.dpi);
-        bevel(
-            dc,
-            &RECT {
-                left: scale(16, ui.dpi),
-                top: sep,
-                right: rc.right - scale(16, ui.dpi),
-                bottom: sep + 2,
-            },
-            false,
-        );
-        if ui.options {
-            let mut r0 = RECT {
-                left: scale(16, ui.dpi),
-                top: scale(80, ui.dpi),
-                right: scale(210, ui.dpi),
-                bottom: scale(100, ui.dpi),
-            };
-            text(
-                dc,
-                "WHISPER MODEL",
-                &mut r0,
-                TAN,
-                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
-            );
-            for (i, l) in OPTION_LABELS.iter().enumerate() {
-                let y = 80 + (i as i32 + 1) * 34;
-                let mut r = RECT {
-                    left: scale(16, ui.dpi),
-                    top: scale(y, ui.dpi),
-                    right: scale(210, ui.dpi),
-                    bottom: scale(y + 20, ui.dpi),
-                };
-                text(dc, l, &mut r, TAN, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-                let h = ui.ctl[&(OPT_BASE + i as i32)];
-                let mut wr = RECT::default();
-                let _ = GetWindowRect(h, &mut wr);
-                let mut pts = [
-                    windows::Win32::Foundation::POINT {
-                        x: wr.left,
-                        y: wr.top,
-                    },
-                    windows::Win32::Foundation::POINT {
-                        x: wr.right,
-                        y: wr.bottom,
-                    },
-                ];
-                windows::Win32::Graphics::Gdi::MapWindowPoints(None, hwnd, &mut pts);
-                bevel(
-                    dc,
-                    &RECT {
-                        left: pts[0].x - 1,
-                        top: pts[0].y - 1,
-                        right: pts[1].x + 1,
-                        bottom: pts[1].y + 1,
-                    },
-                    false,
-                );
+        // Tab sheet.
+        let sheet = sr(ui, 14, 52, WIN_W - 28, WIN_H - 52 - 10);
+        bevel(dc, &sheet, true);
+        let page = if ui.options { PAGE_OPT } else { PAGE_MAIN };
+        for (r, p, raised) in &ui.frames {
+            if *p == page {
+                bevel(dc, r, *raised);
             }
-            let mut r = RECT {
-                left: scale(16, ui.dpi),
-                top: scale(80 + 10 * 34, ui.dpi),
-                right: rc.right - 16,
-                bottom: scale(80 + 10 * 34 + 80, ui.dpi),
-            };
-            let addr = format!(
-                "ffmpeg.exe, ffprobe.exe, whisper-cli.exe with its DLLs, and ggml-*.bin models must be in the same folder as Podcast Trim.exe.\nThe feed server is listening on {}. Use 0.0.0.0 to reach it from your phone on the same network, or 127.0.0.1 for this PC only.",
+        }
+        for (r, s, p, kind) in &ui.labels {
+            if *p != page {
+                continue;
+            }
+            let mut r = *r;
+            if *kind == LabelKind::Header {
+                fill(dc, &r, BG);
+                bevel(dc, &r, true);
+                r.left += scale(5, d);
+            }
+            text(dc, s, &mut r, TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        }
+        if ui.options {
+            let mut r = sr(ui, 28, 380, 840, 80);
+            let note = format!(
+                "Note: ffmpeg.exe, ffprobe.exe, whisper-cli.exe with its DLLs, and ggml-*.bin models must be in the same folder as Podcast Trim.exe.\nThe feed server is listening on {}. Use 0.0.0.0 to reach it from your phone on the same network, or 127.0.0.1 for this PC only. Address and port changes need a restart.",
                 ui.server_addr
             );
-            text(dc, &addr, &mut r, DIM, DT_LEFT);
-        } else {
-            for f in &ui.frames {
-                bevel(dc, f, false);
-            }
-            for (r, s, tan) in &ui.labels {
-                let mut r = *r;
-                text(
-                    dc,
-                    s,
-                    &mut r,
-                    if *tan { TAN } else { DIM },
-                    DT_LEFT | DT_SINGLELINE | DT_VCENTER,
-                );
-            }
+            text(
+                dc,
+                &note,
+                &mut r,
+                DIM,
+                DT_LEFT | windows::Win32::Graphics::Gdi::DT_WORDBREAK,
+            );
         }
         SelectObject(dc, old);
     });
@@ -1454,35 +1573,312 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
     let r = dis.rcItem;
     let pressed = (dis.itemState.0 & ODS_SELECTED.0) != 0;
     let disabled = (dis.itemState.0 & ODS_DISABLED.0) != 0;
-    {
-        FillRect(
-            dc,
-            &r,
-            HBRUSH(BRUSH_BG.load(std::sync::atomic::Ordering::Relaxed) as _),
-        );
-        bevel(dc, &r, !pressed);
-        let old = SelectObject(dc, font());
-        let n = GetWindowTextLengthW(dis.hwndItem);
-        let mut buf = vec![0u16; n as usize + 1];
-        let got = GetWindowTextW(dis.hwndItem, &mut buf);
-        let label = String::from_utf16_lossy(&buf[..got as usize]);
-        let mut tr = r;
-        if pressed {
-            tr.left += 2;
-            tr.top += 2;
+    let id = dis.CtlID as i32;
+    let d = DPI.load(std::sync::atomic::Ordering::Relaxed);
+    fill(dc, &r, BG);
+    let old = SelectObject(dc, font());
+    let n = GetWindowTextLengthW(dis.hwndItem);
+    let mut buf = vec![0u16; n as usize + 1];
+    let got = GetWindowTextW(dis.hwndItem, &mut buf);
+    let label = String::from_utf16_lossy(&buf[..got as usize]);
+    let flags = DT_LEFT | DT_SINGLELINE | DT_VCENTER;
+    match id {
+        B_MIN | B_CLOSE => {
+            bevel(dc, &r, !pressed);
+            let pen = CreatePen(PS_SOLID, 1, COLORREF(LIGHT));
+            let o = SelectObject(dc, pen);
+            let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+            if id == B_MIN {
+                for k in 0..2 {
+                    line(dc, cx - 4, cy + 3 + k, cx + 3, cy + 3 + k);
+                }
+            } else {
+                for k in 0..2 {
+                    line(dc, cx - 4 + k, cy - 4, cx + 4 + k, cy + 4);
+                    line(dc, cx + 3 + k, cy - 4, cx - 5 + k, cy + 4);
+                }
+            }
+            SelectObject(dc, o);
+            let _ = DeleteObject(pen);
         }
-        let is_check = matches!(dis.CtlID as i32, B_TOKEN | B_MONO);
-        if is_check {
-            tr.left += 8;
+        B_TAB_MAIN | B_TAB_OPT => {
+            let active = with(|ui| ui.options)
+                .map(|o| o == (id == B_TAB_OPT))
+                .unwrap_or(id == B_TAB_MAIN);
+            // Raised on three sides; the active tab joins the sheet below it.
+            let mut t = r;
+            if !active {
+                t.top += scale(2, d);
+            }
+            let tab = RECT {
+                bottom: r.bottom + 2,
+                ..t
+            };
+            bevel(dc, &tab, true);
+            if !active {
+                let p = CreatePen(PS_SOLID, 1, COLORREF(LIGHT));
+                let o = SelectObject(dc, p);
+                line(dc, r.left, r.bottom - 1, r.right, r.bottom - 1);
+                SelectObject(dc, o);
+                let _ = DeleteObject(p);
+            }
+            let mut tr = t;
+            tr.left += scale(6, d);
+            text(dc, &label, &mut tr, if active { TAN } else { TEXT }, flags);
         }
-        text(
-            dc,
-            &label,
-            &mut tr,
-            if disabled { DIM } else { TEXT },
-            if is_check { DT_LEFT } else { DT_CENTER } | DT_SINGLELINE | DT_VCENTER,
-        );
-        SelectObject(dc, old);
+        B_TOKEN | B_MONO => {
+            let on = GetWindowLongPtrW(dis.hwndItem, GWLP_USERDATA) != 0;
+            let s = scale(13, d);
+            let bx = RECT {
+                left: r.left,
+                top: (r.top + r.bottom - s) / 2,
+                right: r.left + s,
+                bottom: (r.top + r.bottom + s) / 2,
+            };
+            fill(dc, &bx, FIELD);
+            bevel(dc, &bx, false);
+            if on {
+                let p = CreatePen(PS_SOLID, 1, COLORREF(TEXT));
+                let o = SelectObject(dc, p);
+                for k in 0..2 {
+                    line(dc, bx.left + 3, bx.top + 5 + k, bx.left + 5, bx.top + 7 + k);
+                    line(
+                        dc,
+                        bx.left + 5,
+                        bx.top + 7 + k,
+                        bx.left + 10,
+                        bx.top + 2 + k,
+                    );
+                }
+                SelectObject(dc, o);
+                let _ = DeleteObject(p);
+            }
+            let mut tr = r;
+            tr.left += s + scale(7, d);
+            text(
+                dc,
+                &label,
+                &mut tr,
+                if disabled {
+                    DIM
+                } else if on {
+                    TAN
+                } else {
+                    TEXT
+                },
+                flags,
+            );
+        }
+        B_MODEL => {
+            // Looks like a VGUI drop-down: sunken field with a small arrow.
+            fill(dc, &r, FIELD);
+            bevel(dc, &r, false);
+            let mut tr = r;
+            tr.left += scale(5, d);
+            tr.right -= scale(20, d);
+            text(
+                dc,
+                &label,
+                &mut tr,
+                TEXT,
+                flags | windows::Win32::Graphics::Gdi::DT_END_ELLIPSIS,
+            );
+            let a = RECT {
+                left: r.right - scale(18, d),
+                ..r
+            };
+            arrow(dc, &a, false, LIGHT);
+        }
+        _ => {
+            bevel(dc, &r, !pressed);
+            let mut tr = r;
+            tr.left += scale(6, d);
+            if pressed {
+                tr.left += 1;
+                tr.top += 2;
+            }
+            text(
+                dc,
+                &label,
+                &mut tr,
+                if disabled { DIM } else { TEXT },
+                flags,
+            );
+        }
+    }
+    SelectObject(dc, old);
+}
+
+/// Parent that hides a list's or edit's own scroll bar; forwards everything
+/// the main window needs (commands, owner-draw, colours).
+unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_COMMAND | WM_DRAWITEM | WM_MEASUREITEM | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX
+        | WM_CTLCOLORSTATIC => {
+            let main = GetAncestor(hwnd, GA_ROOT);
+            wndproc(main, msg, wp, lp)
+        }
+        WM_ERASEBKGND => {
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            fill(HDC(wp.0 as _), &rc, FIELD);
+            LRESULT(1)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+thread_local! {
+    /// Scroll bar being dragged: (bar, pixel offset of the grab inside the thumb).
+    static DRAG: std::cell::Cell<Option<(isize, i32)>> = const { std::cell::Cell::new(None) };
+    static LAST: RefCell<HashMap<isize, (i32, i32, u32, i32)>> = RefCell::new(HashMap::new());
+}
+
+fn scroll_target(bar: HWND) -> HWND {
+    HWND(unsafe { GetWindowLongPtrW(bar, GWLP_USERDATA) } as _)
+}
+
+unsafe fn scroll_info(target: HWND) -> SCROLLINFO {
+    let mut si = SCROLLINFO {
+        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_ALL,
+        ..Default::default()
+    };
+    let _ = GetScrollInfo(target, SB_VERT, &mut si);
+    si
+}
+
+/// (track top, track bottom, thumb top, thumb bottom) in bar pixels.
+fn thumb_geometry(si: &SCROLLINFO, h: i32, btn: i32) -> (i32, i32, i32, i32) {
+    let (t0, t1) = (btn, (h - btn).max(btn));
+    let track = t1 - t0;
+    let range = (si.nMax - si.nMin + 1).max(1);
+    let page = (si.nPage as i32).clamp(0, range);
+    if page == 0 || page >= range {
+        return (t0, t1, t0, t1);
+    }
+    let size = (track * page / range).max(btn.min(track));
+    let span = (range - page).max(1);
+    let top = t0 + (track - size) * (si.nPos - si.nMin).clamp(0, span) / span;
+    (t0, t1, top, top + size)
+}
+
+unsafe extern "system" fn scroll_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    let btn = rc.right;
+    let y = ((lp.0 >> 16) & 0xffff) as i16 as i32;
+    match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let dc = BeginPaint(hwnd, &mut ps);
+            let si = scroll_info(scroll_target(hwnd));
+            fill(dc, &rc, BG);
+            bevel(dc, &rc, false);
+            let up = RECT {
+                left: 0,
+                top: 0,
+                right: btn,
+                bottom: btn,
+            };
+            let down = RECT {
+                left: 0,
+                top: rc.bottom - btn,
+                right: btn,
+                bottom: rc.bottom,
+            };
+            for (b, u) in [(up, true), (down, false)] {
+                bevel(dc, &b, true);
+                arrow(dc, &b, u, TEXT);
+            }
+            let (_, _, a, z) = thumb_geometry(&si, rc.bottom, btn);
+            if z - a < rc.bottom - 2 * btn {
+                let th = RECT {
+                    left: 0,
+                    top: a,
+                    right: btn,
+                    bottom: z,
+                };
+                bevel(dc, &th, true);
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            let si = scroll_info(scroll_target(hwnd));
+            let key = hwnd.0 as isize;
+            let now = (si.nMin, si.nMax, si.nPage, si.nPos);
+            let changed = LAST.with(|l| l.borrow_mut().insert(key, now) != Some(now));
+            if changed {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            let target = scroll_target(hwnd);
+            let si = scroll_info(target);
+            let (_, _, a, z) = thumb_geometry(&si, rc.bottom, btn);
+            let code = if y < btn {
+                SB_LINEUP
+            } else if y >= rc.bottom - btn {
+                SB_LINEDOWN
+            } else if y < a {
+                SB_PAGEUP
+            } else if y >= z {
+                SB_PAGEDOWN
+            } else {
+                DRAG.with(|d| d.set(Some((hwnd.0 as isize, y - a))));
+                windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+                return LRESULT(0);
+            };
+            SendMessageW(target, WM_VSCROLL, WPARAM(code.0 as usize), LPARAM(0));
+            let _ = InvalidateRect(hwnd, None, false);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            if let Some((h, off)) = DRAG.with(|d| d.get()) {
+                if h == hwnd.0 as isize {
+                    let target = scroll_target(hwnd);
+                    let si = scroll_info(target);
+                    let (t0, t1, a, z) = thumb_geometry(&si, rc.bottom, btn);
+                    let free = (t1 - t0 - (z - a)).max(1);
+                    let span = (si.nMax - si.nMin + 1 - si.nPage as i32).max(0);
+                    let pos = si.nMin + ((y - off - t0).clamp(0, free) * span + free / 2) / free;
+                    let w = (SB_THUMBTRACK.0 as usize) | ((pos as usize & 0xffff) << 16);
+                    SendMessageW(target, WM_VSCROLL, WPARAM(w), LPARAM(0));
+                    let w = (SB_THUMBPOSITION.0 as usize) | ((pos as usize & 0xffff) << 16);
+                    SendMessageW(target, WM_VSCROLL, WPARAM(w), LPARAM(0));
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            if DRAG.with(|d| d.take()).is_some() {
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+                SendMessageW(
+                    scroll_target(hwnd),
+                    WM_VSCROLL,
+                    WPARAM(SB_ENDSCROLL.0 as usize),
+                    LPARAM(0),
+                );
+            }
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_NCHITTEST => {
+            let mut pt = windows::Win32::Foundation::POINT {
+                x: (lp.0 & 0xffff) as i16 as i32,
+                y: ((lp.0 >> 16) & 0xffff) as i16 as i32,
+            };
+            let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+            let cap = scale(CAPTION_H, DPI.load(std::sync::atomic::Ordering::Relaxed));
+            if pt.y >= 0 && pt.y < cap {
+                return LRESULT(HTCAPTION as isize);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
 
@@ -1493,6 +1889,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        WM_NCHITTEST => {
+            let mut pt = windows::Win32::Foundation::POINT {
+                x: (lp.0 & 0xffff) as i16 as i32,
+                y: ((lp.0 >> 16) & 0xffff) as i16 as i32,
+            };
+            let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+            let cap = scale(CAPTION_H, DPI.load(std::sync::atomic::Ordering::Relaxed));
+            if pt.y >= 0 && pt.y < cap {
+                return LRESULT(HTCAPTION as isize);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         WM_MEASUREITEM => {
             let mis = &mut *(lp.0 as *mut windows::Win32::UI::Controls::MEASUREITEMSTRUCT);
             mis.itemHeight = scale(18, DPI.load(std::sync::atomic::Ordering::Relaxed)) as u32;
@@ -1510,7 +1918,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC => {
             let dc = HDC(wp.0 as _);
             let is_status = lp.0 == STATUS.load(std::sync::atomic::Ordering::Relaxed);
-            SetTextColor(dc, COLORREF(if is_status { TAN } else { TEXT }));
+            SetTextColor(dc, COLORREF(TEXT));
             if is_status {
                 SetBkColor(dc, COLORREF(BG));
                 return LRESULT(BRUSH_BG.load(std::sync::atomic::Ordering::Relaxed));
