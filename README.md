@@ -5,7 +5,7 @@ Windows app that cuts ads out of podcast episodes using a local Whisper transcri
 ## What it does
 
 1. You add a show by pasting its RSS link. Podcast Trim reads the feed and lists its episodes.
-2. **Download + transcribe** downloads an episode, records the SHA-256 hash of the file, and transcribes it on the CPU with [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Every transcript line has start and end times.
+2. **Download + transcribe** downloads an episode, records the SHA-256 hash of the file, and transcribes it on the CPU with [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Every transcript line has start and end times. A progress bar at the bottom of the window follows the download, the transcription, and the cutting, and Cancel stops the running step and its ffmpeg or whisper.cpp process.
 3. **Copy AI prompt** copies a ready-made prompt plus the transcript to the clipboard. Paste it into any AI chat. No AI service is built in and nothing is sent anywhere by the app.
 4. Paste the AI's reply into the reply box and press **Check cuts**. The reply must be a list of ad time ranges (format below). Podcast Trim never runs commands from the reply. It checks that every range is inside the episode, ends after it starts, and does not overlap another range, then shows the cut list and the exact ffmpeg command it will run.
 5. **Approve and cut** runs ffmpeg itself (as an argument list, without a shell) and writes an Ogg Opus file (`.opus`) without the ads. The original download is deleted.
@@ -89,7 +89,7 @@ cargo clippy --all-targets
 
 ## Look
 
-The window copies the general look of late-1990s game dialogs: olive panels, light text with khaki for the active tab and checked options, a mustard selection bar, 1-pixel light and dark bevels, and the app's own caption bar, tabs, buttons, and scroll bars. It is drawn with plain Win32 and GDI. Text uses Tahoma, which ships with Windows, at 13 pixels without smoothing. No game assets are included.
+The window copies the general look of late-1990s game dialogs: olive panels, light text with khaki for the active tab and checked options, a mustard selection bar, 1-pixel light and dark bevels, and the app's own caption bar, tabs, buttons, and scroll bars. It is drawn with plain Win32 and GDI. Text uses Tahoma, which ships with Windows, at 13 pixels without smoothing. The progress bar copies the segmented bar of the game's loading dialog. The window can be resized from the grip in its bottom-right corner, down to 900 by 600 pixels. No game assets are included.
 
 ## License
 

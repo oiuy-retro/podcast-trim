@@ -20,16 +20,17 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, GetDC, GetDeviceCaps, InvalidateRect, LineTo, MoveToEx, ReleaseDC, SelectObject,
-    SetBkColor, SetBkMode, SetTextColor, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH,
-    HDC, HFONT, LOGPIXELSX, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+    FillRect, GetDC, GetDeviceCaps, InvalidateRect, LineTo, MoveToEx, RedrawWindow, ReleaseDC,
+    SelectObject, SetBkColor, SetBkMode, SetTextColor, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, HBRUSH, HDC, HFONT, LOGPIXELSX, PAINTSTRUCT, PS_SOLID, RDW_ALLCHILDREN, RDW_ERASE,
+    RDW_INVALIDATE, TRANSPARENT,
 };
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_SELECTED};
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // GoldSource VGUI-like palette (approximate, picked by eye).
@@ -41,12 +42,18 @@ const TEXT: u32 = rgb(216, 222, 211);
 const TAN: u32 = rgb(196, 181, 80);
 const DIM: u32 = rgb(117, 128, 111);
 const SEL: u32 = rgb(149, 136, 49);
+/// Scroll bar track and read-only ("disabled") field text, measured from the HLDS dialogs.
+const TRACK: u32 = rgb(90, 106, 79);
+const DISABLED_TEXT: u32 = rgb(149, 161, 141);
+const BLACK: u32 = rgb(0, 0, 0);
 
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
 }
 
 const WM_REFRESH: u32 = WM_APP + 1;
+/// A worker reported progress; repaint the bar and the status line.
+const WM_PROGRESS: u32 = WM_APP + 2;
 
 // Control ids
 const ID_SHOWS: i32 = 100;
@@ -70,6 +77,8 @@ const B_SAVE: i32 = 210;
 const B_TAB_OPT: i32 = 211;
 const B_MIN: i32 = 215;
 const B_CLOSE: i32 = 216;
+const B_CANCEL: i32 = 217;
+const ID_PROGRESS: i32 = 107;
 const B_TOKEN: i32 = 212;
 const OPT_BASE: i32 = 300;
 
@@ -112,6 +121,36 @@ struct Ui {
     /// Every top-level child and the page it belongs to.
     pages: Vec<(HWND, u8)>,
     icon: HICON,
+    /// How the next created element follows a resize (see `Anchor`).
+    anchor: Anchor,
+    items: Vec<Placed>,
+    feed_frame: usize,
+}
+
+/// How an element follows the window size: fractions of the extra width
+/// added to its left and right edge, and of the extra height added to its top
+/// and bottom edge.
+#[derive(Clone, Copy)]
+struct Anchor(f32, f32, f32, f32);
+
+const FIXED: Anchor = Anchor(0.0, 0.0, 0.0, 0.0);
+
+/// An element, its base rect, and its anchor.
+type Placed = (Item, (i32, i32, i32, i32), Anchor);
+
+/// Something `layout` moves: base rect (96-DPI pixels at 900x600) and anchor.
+enum Item {
+    Win(HWND),
+    Frame(usize),
+    Label(usize),
+    Boxed {
+        clip: HWND,
+        ctl: HWND,
+        sb: HWND,
+        frame: usize,
+        header: Option<usize>,
+        pad: i32,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -130,6 +169,49 @@ fn font() -> HFONT {
 }
 
 static DPI: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(96);
+static FEED: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static MAIN: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// Progress of the running job in 1/1000, and what it is doing.
+static PROGRESS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static STAGE: Mutex<String> = Mutex::new(String::new());
+static CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The external program the worker is waiting on, so Cancel can stop it.
+static CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
+
+const CANCELLED: &str = "Cancelled.";
+
+fn cancelled() -> bool {
+    CANCEL.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Stop the running job: set the flag (downloads check it per chunk) and
+/// kill the child process, if any. The worker sees its pipes close and returns.
+fn cancel_job() {
+    CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(c) = CHILD.lock().unwrap().as_mut() {
+        let _ = c.kill();
+    }
+}
+
+fn set_progress(stage: &str, fraction: f64) {
+    let v = (fraction.clamp(0.0, 1.0) * 1000.0).round() as i32;
+    let old = PROGRESS.swap(v, std::sync::atomic::Ordering::Relaxed);
+    let changed_stage = {
+        let mut st = STAGE.lock().unwrap();
+        if *st != stage {
+            *st = stage.to_string();
+            true
+        } else {
+            false
+        }
+    };
+    if old != v || changed_stage {
+        unsafe {
+            let h = HWND(MAIN.load(std::sync::atomic::Ordering::Relaxed) as _);
+            let _ = PostMessageW(h, WM_PROGRESS, WPARAM(0), LPARAM(0));
+        }
+    }
+}
 
 thread_local! {
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
@@ -186,23 +268,109 @@ struct SysEnv;
 
 impl Env for SysEnv {
     fn fetch(&self, url: &str, dest: &Path) -> Result<(), String> {
-        net::download(url, dest)
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
+        set_progress("Downloading", 0.0);
+        net::download(url, dest, &mut |got, total| {
+            match total {
+                Some(t) => set_progress("Downloading", got as f64 / t as f64),
+                None => set_progress(&format!("Downloading ({} MB)", got >> 20), 0.0),
+            }
+            !cancelled()
+        })
     }
     fn run(&self, program: &str, args: &[String]) -> Result<String, String> {
-        let out = std::process::Command::new(program)
+        self.run_watch(program, args, &mut |_| {})
+    }
+    fn run_watch(
+        &self,
+        program: &str,
+        args: &[String],
+        line: &mut dyn FnMut(&str),
+    ) -> Result<String, String> {
+        use std::io::BufRead;
+        use std::process::Stdio;
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
+        let mut child = std::process::Command::new(program)
             .args(args)
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-            .stdin(std::process::Stdio::null())
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| format!("Could not start {program}: {e}. Check the path in Options."))?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let tail: Vec<&str> = err.lines().rev().take(4).collect();
-            let tail: Vec<&str> = tail.into_iter().rev().collect();
-            return Err(format!("{program} failed: {}", tail.join(" | ")));
+        let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+        let pipes: [(bool, Box<dyn std::io::Read + Send>); 2] = [
+            (true, Box::new(child.stdout.take().unwrap())),
+            (false, Box::new(child.stderr.take().unwrap())),
+        ];
+        let readers: Vec<_> = pipes
+            .into_iter()
+            .map(|(is_out, pipe)| {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    for l in std::io::BufReader::new(pipe).split(b'\n') {
+                        let Ok(l) = l else { break };
+                        let l = String::from_utf8_lossy(&l)
+                            .trim_end_matches('\r')
+                            .to_string();
+                        if tx.send((is_out, l)).is_err() {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+        *CHILD.lock().unwrap() = Some(child);
+        // Cancel may have landed between the check above and storing the child.
+        if cancelled() {
+            if let Some(c) = CHILD.lock().unwrap().as_mut() {
+                let _ = c.kill();
+            }
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        let mut stdout = String::new();
+        let mut tail: std::collections::VecDeque<String> = Default::default();
+        for (is_out, l) in rx {
+            line(&l);
+            if is_out {
+                stdout.push_str(&l);
+                stdout.push('\n');
+            } else if !l.trim().is_empty() && whisper_noise(&l).is_none() {
+                tail.push_back(l);
+                if tail.len() > 4 {
+                    tail.pop_front();
+                }
+            }
+        }
+        for r in readers {
+            let _ = r.join();
+        }
+        let status = CHILD.lock().unwrap().take().map(|mut c| c.wait());
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
+        match status {
+            Some(Ok(st)) if st.success() => Ok(stdout),
+            Some(Ok(_)) => Err(format!(
+                "{program} failed: {}",
+                tail.into_iter().collect::<Vec<_>>().join(" | ")
+            )),
+            Some(Err(e)) => Err(format!("{program}: {e}")),
+            None => Err(CANCELLED.into()),
+        }
     }
+    fn progress(&self, stage: &str, fraction: f64) {
+        set_progress(stage, fraction);
+    }
+}
+
+/// whisper.cpp progress lines are not useful in an error message.
+fn whisper_noise(l: &str) -> Option<f64> {
+    podcast_trim::progress::whisper_percent(l)
 }
 
 fn scale(v: i32, dpi: i32) -> i32 {
@@ -297,6 +465,13 @@ pub fn run() -> i32 {
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             ..Default::default()
         });
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(progress_proc),
+            hInstance: instance,
+            lpszClassName: w!("PodcastTrimProgress"),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            ..Default::default()
+        });
         let dc = GetDC(None);
         let dpi = GetDeviceCaps(dc, LOGPIXELSX).max(96);
         ReleaseDC(None, dc);
@@ -332,6 +507,7 @@ pub fn run() -> i32 {
         if hwnd.0.is_null() {
             return 1;
         }
+        MAIN.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
         let ui = Ui {
             hwnd,
             shared: shared.clone(),
@@ -353,6 +529,9 @@ pub fn run() -> i32 {
             frames: vec![],
             labels: vec![],
             pages: vec![],
+            anchor: FIXED,
+            items: vec![],
+            feed_frame: usize::MAX,
             icon: LoadImageW(
                 instance,
                 PCWSTR(1 as _),
@@ -372,6 +551,7 @@ pub fn run() -> i32 {
         FONT.store(ui.font.0 as isize, std::sync::atomic::Ordering::Relaxed);
         UI.with(|u| *u.borrow_mut() = Some(ui));
         build_controls(instance);
+        layout();
         let hraw = hwnd.0 as isize;
         let notify: server::Notify = Arc::new(move || {
             let _ = PostMessageW(HWND(hraw as _), WM_REFRESH, WPARAM(0), LPARAM(0));
@@ -442,6 +622,9 @@ unsafe fn child(
     SendMessageW(h, WM_SETFONT, WPARAM(ui.font.0 as usize), LPARAM(1));
     ui.ctl.insert(id, h);
     ui.pages.push((h, page));
+    if parent == ui.hwnd {
+        ui.items.push((Item::Win(h), r, ui.anchor));
+    }
     h
 }
 
@@ -491,6 +674,8 @@ fn field(
 ) -> HWND {
     let fr = sr(ui, r.0, r.1, r.2, r.3);
     ui.frames.push((fr, page, false));
+    ui.items
+        .push((Item::Frame(ui.frames.len() - 1), r, ui.anchor));
     unsafe {
         child(
             ui,
@@ -523,8 +708,10 @@ fn boxed(
     let d = ui.dpi;
     let fr = sr(ui, r.0, r.1, r.2, r.3);
     ui.frames.push((fr, page, false));
+    let frame = ui.frames.len() - 1;
     let (ix, iy, iw, ih) = (r.0 + 1, r.1 + 1, r.2 - 2, r.3 - 2);
     let hh = if header.is_some() { 20 } else { 0 };
+    let header_at = header.map(|_| ui.labels.len());
     if let Some(h) = header {
         ui.labels.push((
             sr(ui, ix, iy, iw - SB_W, hh),
@@ -587,7 +774,88 @@ fn boxed(
         SetWindowLongPtrW(sb, GWLP_USERDATA, ctl.0 as isize);
         SetTimer(sb, 1, 120, None);
         ui.pages.push((sb, page));
+        let item = Item::Boxed {
+            clip,
+            ctl,
+            sb,
+            frame,
+            header: header_at,
+            pad,
+        };
+        ui.items.push((item, r, ui.anchor));
     }
+}
+
+/// Base rect moved by its anchor for a window `dx`/`dy` larger than 900x600.
+fn anchored(r: (i32, i32, i32, i32), a: Anchor, dx: i32, dy: i32) -> (i32, i32, i32, i32) {
+    let f = |v: f32, d: i32| (v * d as f32).round() as i32;
+    let x0 = r.0 + f(a.0, dx);
+    let x1 = r.0 + r.2 + f(a.1, dx);
+    let y0 = r.1 + f(a.2, dy);
+    let y1 = r.1 + r.3 + f(a.3, dy);
+    (x0, y0, (x1 - x0).max(0), (y1 - y0).max(0))
+}
+
+/// Place everything for the current client size.
+fn layout() {
+    with(|ui| unsafe {
+        let d = ui.dpi;
+        let mut rc = RECT::default();
+        let _ = GetClientRect(ui.hwnd, &mut rc);
+        let (w, h) = (rc.right * 96 / d, rc.bottom * 96 / d);
+        let (dx, dy) = ((w - WIN_W).max(0), (h - WIN_H).max(0));
+        let place = |h: HWND, x: i32, y: i32, cw: i32, ch: i32| {
+            let _ = SetWindowPos(
+                h,
+                None,
+                scale(x, d),
+                scale(y, d),
+                scale(cw, d),
+                scale(ch, d),
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        };
+        for i in 0..ui.items.len() {
+            let (x, y, cw, ch) = anchored(ui.items[i].1, ui.items[i].2, dx, dy);
+            match ui.items[i].0 {
+                Item::Win(h) => place(h, x, y, cw, ch),
+                Item::Frame(f) => ui.frames[f].0 = sr(ui, x, y, cw, ch),
+                Item::Label(l) => ui.labels[l].0 = sr(ui, x, y, cw, ch),
+                Item::Boxed {
+                    clip,
+                    ctl,
+                    sb,
+                    frame,
+                    header,
+                    pad,
+                } => {
+                    ui.frames[frame].0 = sr(ui, x, y, cw, ch);
+                    let (ix, iy, iw, ih) = (x + 1, y + 1, cw - 2, ch - 2);
+                    let hh = if header.is_some() { 20 } else { 0 };
+                    if let Some(l) = header {
+                        ui.labels[l].0 = sr(ui, ix, iy, iw - SB_W, hh);
+                    }
+                    place(clip, ix, iy + hh, iw - SB_W, ih - hh);
+                    let _ = SetWindowPos(
+                        ctl,
+                        None,
+                        scale(pad, d),
+                        scale(pad, d),
+                        scale(iw - SB_W - pad, d) + GetSystemMetrics(SM_CXVSCROLL),
+                        scale(ih - hh - pad, d),
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    place(sb, ix + iw - SB_W, iy, SB_W, ih);
+                }
+            }
+        }
+        let _ = RedrawWindow(
+            ui.hwnd,
+            None,
+            None,
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+        );
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -610,6 +878,8 @@ fn button(ui: &mut Ui, instance: HINSTANCE, text: &str, id: i32, page: u8, x: i3
 fn label(ui: &mut Ui, text: &str, page: u8, x: i32, y: i32, w: i32) {
     let r = sr(ui, x, y, w, 16);
     ui.labels.push((r, text.into(), page, LabelKind::Plain));
+    ui.items
+        .push((Item::Label(ui.labels.len() - 1), (x, y, w, 16), ui.anchor));
 }
 
 fn build_controls(instance: HINSTANCE) {
@@ -617,6 +887,7 @@ fn build_controls(instance: HINSTANCE) {
         let (l, e) = (w!("LISTBOX"), w!("EDIT"));
         let bt = w!("BUTTON");
         // Caption buttons and tabs
+        ui.anchor = Anchor(1.0, 1.0, 0.0, 0.0);
         child(
             ui,
             instance,
@@ -639,6 +910,7 @@ fn build_controls(instance: HINSTANCE) {
             PAGE_ALL,
             (WIN_W - 26, 5, 18, 17),
         );
+        ui.anchor = FIXED;
         child(
             ui,
             instance,
@@ -664,6 +936,7 @@ fn build_controls(instance: HINSTANCE) {
 
         // Episodes page
         let m = PAGE_MAIN;
+        ui.anchor = Anchor(0.0, 0.3, 0.0, 1.0);
         boxed(
             ui,
             instance,
@@ -674,11 +947,14 @@ fn build_controls(instance: HINSTANCE) {
             Some("Show"),
             (24, 68, 264, 296),
         );
+        ui.anchor = Anchor(0.0, 0.3, 1.0, 1.0);
         label(ui, "Show RSS link", m, 24, 374, 264);
         field(ui, instance, EDIT, ID_URL, m, (24, 392, 264, 22));
+        ui.anchor = Anchor(0.0, 0.0, 1.0, 1.0);
         button(ui, instance, "Add show", B_ADD, m, 24, 422, 90);
         button(ui, instance, "Check for new", B_REFRESH, m, 120, 422, 110);
 
+        ui.anchor = Anchor(0.3, 0.65, 0.0, 1.0);
         boxed(
             ui,
             instance,
@@ -689,6 +965,7 @@ fn build_controls(instance: HINSTANCE) {
             Some("Episode"),
             (300, 68, 296, 296),
         );
+        ui.anchor = Anchor(0.3, 0.3, 1.0, 1.0);
         button(
             ui,
             instance,
@@ -703,6 +980,7 @@ fn build_controls(instance: HINSTANCE) {
         button(ui, instance, "Regenerate", B_REGEN, m, 300, 404, 100);
         button(ui, instance, "Export Opus...", B_EXPORT, m, 406, 404, 110);
 
+        ui.anchor = Anchor(0.65, 1.0, 0.0, 1.0);
         boxed(
             ui,
             instance,
@@ -713,6 +991,7 @@ fn build_controls(instance: HINSTANCE) {
             Some("Details"),
             (608, 68, 268, 196),
         );
+        ui.anchor = Anchor(0.65, 1.0, 1.0, 1.0);
         label(ui, "Paste the AI's reply", m, 608, 274, 268);
         boxed(
             ui,
@@ -724,30 +1003,57 @@ fn build_controls(instance: HINSTANCE) {
             None,
             (608, 292, 268, 72),
         );
+        ui.anchor = Anchor(0.65, 0.65, 1.0, 1.0);
         button(ui, instance, "Check cuts", B_CHECK, m, 608, 374, 96);
         button(ui, instance, "Approve and cut", B_APPROVE, m, 710, 374, 120);
 
-        label(ui, "Feed link for your podcast app", m, 24, 462, 400);
+        ui.anchor = Anchor(0.0, 0.0, 1.0, 1.0);
+        label(ui, "Feed link for your podcast app", m, 24, 458, 400);
+        ui.anchor = Anchor(0.0, 1.0, 1.0, 1.0);
+        // Read-only, drawn like the HLDS dialogs' disabled fields.
         field(
             ui,
             instance,
             EDIT | ES_READONLY as u32,
             ID_FEED,
             m,
-            (24, 480, 730, 22),
+            (24, 476, 730, 22),
         );
-        button(ui, instance, "Copy feed link", B_COPYFEED, m, 766, 479, 110);
+        ui.feed_frame = ui.frames.len() - 1;
+        FEED.store(
+            ui.ctl[&ID_FEED].0 as isize,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        ui.anchor = Anchor(1.0, 1.0, 1.0, 1.0);
+        button(ui, instance, "Copy feed link", B_COPYFEED, m, 766, 475, 110);
+        // Status line, then the job's progress bar and Cancel, laid out like
+        // the GoldSource "Loading..." dialog.
+        ui.anchor = Anchor(0.0, 1.0, 1.0, 1.0);
         child(
             ui,
             instance,
             ui.hwnd,
             w!("STATIC"),
             "",
-            0x0C | 0x80,
+            0x0C | 0x80 | 0x4000, // SS_LEFTNOWORDWRAP | SS_NOPREFIX | SS_ENDELLIPSIS
             ID_STATUS,
             PAGE_ALL,
-            (24, 518, 852, 34),
+            (24, 516, 852, 16),
         );
+        child(
+            ui,
+            instance,
+            ui.hwnd,
+            w!("PodcastTrimProgress"),
+            "",
+            0,
+            ID_PROGRESS,
+            PAGE_ALL,
+            (24, 539, 730, 24),
+        );
+        ui.anchor = Anchor(1.0, 1.0, 1.0, 1.0);
+        button(ui, instance, "Cancel", B_CANCEL, PAGE_ALL, 766, 539, 110);
+        ui.anchor = FIXED;
         STATUS.store(
             ui.ctl[&ID_STATUS].0 as isize,
             std::sync::atomic::Ordering::Relaxed,
@@ -755,6 +1061,7 @@ fn build_controls(instance: HINSTANCE) {
 
         // Options page
         let o = PAGE_OPT;
+        ui.anchor = FIXED;
         let s = ui.shared.lock().unwrap().settings.clone();
         label(ui, "Whisper model", o, 28, 76, 180);
         child(
@@ -812,7 +1119,9 @@ fn build_controls(instance: HINSTANCE) {
             o,
             (440, 340, 120, 20),
         );
-        button(ui, instance, "Save", B_SAVE, o, 796, 556, 80);
+        ui.anchor = Anchor(1.0, 1.0, 0.0, 0.0);
+        button(ui, instance, "Save", B_SAVE, o, 796, 72, 80);
+        ui.anchor = FIXED;
     });
     set_page(false);
     update_buttons();
@@ -852,8 +1161,16 @@ fn state_tag(s: State) -> &'static str {
     }
 }
 
-fn fill_list(h: HWND, items: &[String], keep: Option<usize>) {
+/// Fill a list; an empty list is hidden so its clip parent shows
+/// `empty` instead, like "No players are currently connected to the server."
+fn fill_list(h: HWND, items: &[String], keep: Option<usize>, empty: &str) {
     unsafe {
+        if let Ok(clip) = GetParent(h) {
+            let w = wide(if items.is_empty() { empty } else { "" });
+            let _ = SetWindowTextW(clip, PCWSTR(w.as_ptr()));
+            let _ = ShowWindow(h, if items.is_empty() { SW_HIDE } else { SW_SHOWNA });
+            let _ = InvalidateRect(clip, None, true);
+        }
         SendMessageW(h, WM_SETREDRAW, WPARAM(0), LPARAM(0));
         SendMessageW(h, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
         for it in items {
@@ -917,7 +1234,12 @@ fn refresh_lists() {
             })
             .collect();
         let keep_show = keep_show.or(if names.is_empty() { None } else { Some(0) });
-        fill_list(ui.ctl[&ID_SHOWS], &names, keep_show);
+        fill_list(
+            ui.ctl[&ID_SHOWS],
+            &names,
+            keep_show,
+            "No shows yet. Paste a show's RSS link below and press Add show.",
+        );
         let show = keep_show
             .and_then(|i| ui.show_ids.get(i))
             .and_then(|id| sh.lib.show(*id));
@@ -935,7 +1257,12 @@ fn refresh_lists() {
             })
             .unwrap_or_default();
         ui.ep_guids = guids;
-        fill_list(ui.ctl[&ID_EPS], &eps, keep_ep);
+        let none = if show.is_some() {
+            "This show has no episodes yet."
+        } else {
+            "No show is selected."
+        };
+        fill_list(ui.ctl[&ID_EPS], &eps, keep_ep, none);
         let link = show.map(|s| feed_link(ui, &sh, s.id)).unwrap_or_default();
         set_text(ui.ctl[&ID_FEED], &link);
         if let Some(last) = sh.log.last() {
@@ -1024,6 +1351,7 @@ fn update_buttons() {
         en(B_REGEN, idle && st == Some(State::Delivered));
         en(B_EXPORT, idle && st == Some(State::Ready));
         en(B_COPYFEED, show.is_some());
+        en(B_CANCEL, ui.busy);
         SetWindowLongPtrW(ui.ctl[&B_TOKEN], GWLP_USERDATA, ui.token_on as isize);
         SetWindowLongPtrW(ui.ctl[&B_MONO], GWLP_USERDATA, ui.mono_on as isize);
         let _ = InvalidateRect(ui.ctl[&B_TOKEN], None, false);
@@ -1052,6 +1380,9 @@ fn background(
     label: &str,
     job: impl FnOnce(&SharedRef) -> Result<String, String> + Send + 'static,
 ) {
+    CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+    PROGRESS.store(0, std::sync::atomic::Ordering::Relaxed);
+    *STAGE.lock().unwrap() = label.to_string();
     let Some((shared, hraw)) = with(|ui| {
         ui.busy = true;
         status(ui, &format!("{label}..."));
@@ -1063,8 +1394,13 @@ fn background(
     std::thread::spawn(move || {
         let msg = match job(&shared) {
             Ok(m) => m,
+            Err(e) if e == CANCELLED => {
+                "Cancelled. Steps that had already finished are kept.".to_string()
+            }
             Err(e) => format!("Error: {e}"),
         };
+        PROGRESS.store(0, std::sync::atomic::Ordering::Relaxed);
+        STAGE.lock().unwrap().clear();
         {
             let mut sh = shared.lock().unwrap();
             sh.note(msg);
@@ -1332,6 +1668,10 @@ fn on_command(id: i32, code: u32) {
                 status(ui, "Feed link copied. Replace <this-pc-address> with this PC's address if shown, or set it in Options.");
             });
         }
+        B_CANCEL => {
+            cancel_job();
+            with(|ui| status(ui, "Cancelling..."));
+        }
         B_TAB_OPT => set_page(true),
         B_TAB_MAIN => set_page(false),
         B_MIN => unsafe {
@@ -1462,6 +1802,7 @@ unsafe fn paint(hwnd: HWND) {
     with(|ui| {
         let mut rc = RECT::default();
         let _ = GetClientRect(hwnd, &mut rc);
+        let (cw, ch) = (rc.right * 96 / ui.dpi, rc.bottom * 96 / ui.dpi);
         FillRect(dc, &rc, ui.brush_bg);
         // Window frame: light top/left, dark bottom/right.
         bevel(dc, &rc, true);
@@ -1488,14 +1829,24 @@ unsafe fn paint(hwnd: HWND) {
             DT_LEFT | DT_SINGLELINE | DT_VCENTER,
         );
         // Tab sheet.
-        let sheet = sr(ui, 14, 52, WIN_W - 28, WIN_H - 52 - 10);
+        let sheet = sr(ui, 14, 52, cw - 28, ch - 52 - 10);
         bevel(dc, &sheet, true);
         let page = if ui.options { PAGE_OPT } else { PAGE_MAIN };
-        for (r, p, raised) in &ui.frames {
+        for (i, (r, p, raised)) in ui.frames.iter().enumerate() {
             if *p == page {
+                if !*raised {
+                    let inner = RECT {
+                        left: r.left + 1,
+                        top: r.top + 1,
+                        right: r.right - 1,
+                        bottom: r.bottom - 1,
+                    };
+                    fill(dc, &inner, if i == ui.feed_frame { BG } else { FIELD });
+                }
                 bevel(dc, r, *raised);
             }
         }
+        grip(dc, &rc);
         for (r, s, p, kind) in &ui.labels {
             if *p != page {
                 continue;
@@ -1509,7 +1860,7 @@ unsafe fn paint(hwnd: HWND) {
             text(dc, s, &mut r, TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         }
         if ui.options {
-            let mut r = sr(ui, 28, 380, 840, 80);
+            let mut r = sr(ui, 28, 380, cw - 60, 80);
             let note = format!(
                 "Note: ffmpeg.exe, ffprobe.exe, whisper-cli.exe with its DLLs, and ggml-*.bin models must be in the same folder as Podcast Trim.exe.\nThe feed server is listening on {}. Use 0.0.0.0 to reach it from your phone on the same network, or 127.0.0.1 for this PC only. Address and port changes need a restart.",
                 ui.server_addr
@@ -1525,6 +1876,56 @@ unsafe fn paint(hwnd: HWND) {
         SelectObject(dc, old);
     });
     let _ = EndPaint(hwnd, &ps);
+}
+
+/// VGUI resize grip: three light diagonals with dark shadows in the corner.
+unsafe fn grip(dc: HDC, rc: &RECT) {
+    let (r, b) = (rc.right - 2, rc.bottom - 2);
+    let pl = CreatePen(PS_SOLID, 1, COLORREF(LIGHT));
+    let pd = CreatePen(PS_SOLID, 1, COLORREF(DARK));
+    let old = SelectObject(dc, pl);
+    for k in 0..3 {
+        let o = 3 + k * 4;
+        SelectObject(dc, pl);
+        line(dc, r - o, b, r + 1, b - o - 1);
+        SelectObject(dc, pd);
+        line(dc, r - o + 1, b, r + 1, b - o);
+    }
+    SelectObject(dc, old);
+    let _ = DeleteObject(pl);
+    let _ = DeleteObject(pd);
+}
+
+/// GoldSource "Loading..." bar: sunken olive track, discrete khaki blocks.
+unsafe extern "system" fn progress_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let dc = BeginPaint(hwnd, &mut ps);
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            fill(dc, &rc, FIELD);
+            bevel(dc, &rc, false);
+            let d = DPI.load(std::sync::atomic::Ordering::Relaxed);
+            let (inset, bw, gap) = (scale(4, d), scale(8, d), scale(4, d));
+            let frac = PROGRESS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
+            let (_, on) = podcast_trim::progress::blocks(rc.right - 2 * inset, bw, gap, frac);
+            for i in 0..on {
+                let x = inset + i * (bw + gap);
+                let blk = RECT {
+                    left: x,
+                    top: inset,
+                    right: x + bw,
+                    bottom: rc.bottom - inset,
+                };
+                fill(dc, &blk, TAN);
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
 }
 
 unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
@@ -1687,10 +2088,37 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
                 left: r.right - scale(18, d),
                 ..r
             };
-            arrow(dc, &a, false, LIGHT);
+            // Small 5x3 arrow straight on the field, as in the HLDS combo boxes.
+            let (cx, cy) = ((a.left + a.right) / 2, (a.top + a.bottom) / 2);
+            let p = CreatePen(PS_SOLID, 1, COLORREF(DISABLED_TEXT));
+            let o = SelectObject(dc, p);
+            for i in 0..3 {
+                line(dc, cx - 2 + i, cy - 1 + i, cx + 3 - i, cy - 1 + i);
+            }
+            SelectObject(dc, o);
+            let _ = DeleteObject(p);
         }
         _ => {
-            bevel(dc, &r, !pressed);
+            // Focused (default) button: black outline around the bevel.
+            let focus = (dis.itemState.0 & ODS_FOCUS.0) != 0 && !disabled;
+            let mut br = r;
+            if focus {
+                let p = CreatePen(PS_SOLID, 1, COLORREF(BLACK));
+                let o = SelectObject(dc, p);
+                line(dc, r.left, r.top, r.right - 1, r.top);
+                line(dc, r.right - 1, r.top, r.right - 1, r.bottom - 1);
+                line(dc, r.right - 1, r.bottom - 1, r.left, r.bottom - 1);
+                line(dc, r.left, r.bottom - 1, r.left, r.top);
+                SelectObject(dc, o);
+                let _ = DeleteObject(p);
+                br = RECT {
+                    left: r.left + 1,
+                    top: r.top + 1,
+                    right: r.right - 1,
+                    bottom: r.bottom - 1,
+                };
+            }
+            bevel(dc, &br, !pressed);
             let mut tr = r;
             tr.left += scale(6, d);
             if pressed {
@@ -1723,6 +2151,31 @@ unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             let _ = GetClientRect(hwnd, &mut rc);
             fill(HDC(wp.0 as _), &rc, FIELD);
             LRESULT(1)
+        }
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let dc = BeginPaint(hwnd, &mut ps);
+            let msg = get_text(hwnd);
+            if !msg.is_empty() {
+                let d = DPI.load(std::sync::atomic::Ordering::Relaxed);
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                fill(dc, &rc, FIELD);
+                rc.left += scale(5, d);
+                rc.top += scale(4, d);
+                rc.right -= scale(5, d);
+                let old = SelectObject(dc, font());
+                text(
+                    dc,
+                    &msg,
+                    &mut rc,
+                    TEXT,
+                    DT_LEFT | windows::Win32::Graphics::Gdi::DT_WORDBREAK,
+                );
+                SelectObject(dc, old);
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
@@ -1773,8 +2226,17 @@ unsafe extern "system" fn scroll_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             let mut ps = PAINTSTRUCT::default();
             let dc = BeginPaint(hwnd, &mut ps);
             let si = scroll_info(scroll_target(hwnd));
-            fill(dc, &rc, BG);
-            bevel(dc, &rc, false);
+            // Lighter track with a dark left edge and a light right edge.
+            fill(dc, &rc, TRACK);
+            let pd = CreatePen(PS_SOLID, 1, COLORREF(DARK));
+            let pl = CreatePen(PS_SOLID, 1, COLORREF(LIGHT));
+            let o = SelectObject(dc, pd);
+            line(dc, 0, 0, 0, rc.bottom);
+            SelectObject(dc, pl);
+            line(dc, rc.right - 1, 0, rc.right - 1, rc.bottom);
+            SelectObject(dc, o);
+            let _ = DeleteObject(pd);
+            let _ = DeleteObject(pl);
             let up = RECT {
                 left: 0,
                 top: 0,
@@ -1788,6 +2250,7 @@ unsafe extern "system" fn scroll_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 bottom: rc.bottom,
             };
             for (b, u) in [(up, true), (down, false)] {
+                fill(dc, &b, BG);
                 bevel(dc, &b, true);
                 arrow(dc, &b, u, TEXT);
             }
@@ -1799,6 +2262,7 @@ unsafe extern "system" fn scroll_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     right: btn,
                     bottom: z,
                 };
+                fill(dc, &th, BG);
                 bevel(dc, &th, true);
             }
             let _ = EndPaint(hwnd, &ps);
@@ -1895,11 +2359,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 y: ((lp.0 >> 16) & 0xffff) as i16 as i32,
             };
             let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
-            let cap = scale(CAPTION_H, DPI.load(std::sync::atomic::Ordering::Relaxed));
-            if pt.y >= 0 && pt.y < cap {
+            let d = DPI.load(std::sync::atomic::Ordering::Relaxed);
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            let g = scale(16, d);
+            if !IsZoomed(hwnd).as_bool() && pt.x >= rc.right - g && pt.y >= rc.bottom - g {
+                return LRESULT(HTBOTTOMRIGHT as isize);
+            }
+            if pt.y >= 0 && pt.y < scale(CAPTION_H, d) {
                 return LRESULT(HTCAPTION as isize);
             }
             DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_GETMINMAXINFO => {
+            let d = DPI.load(std::sync::atomic::Ordering::Relaxed);
+            let mm = &mut *(lp.0 as *mut MINMAXINFO);
+            mm.ptMinTrackSize.x = scale(WIN_W, d);
+            mm.ptMinTrackSize.y = scale(WIN_H, d);
+            LRESULT(0)
+        }
+        WM_SIZE => {
+            layout();
+            LRESULT(0)
+        }
+        WM_PROGRESS => {
+            let pct = PROGRESS.load(std::sync::atomic::Ordering::Relaxed);
+            let stage = STAGE.lock().unwrap().clone();
+            with(|ui| unsafe {
+                if ui.busy && !cancelled() && !stage.is_empty() {
+                    status(ui, &format!("{stage}... {}%", pct / 10));
+                }
+                let _ = InvalidateRect(ui.ctl[&ID_PROGRESS], None, false);
+            });
+            LRESULT(0)
         }
         WM_MEASUREITEM => {
             let mis = &mut *(lp.0 as *mut windows::Win32::UI::Controls::MEASUREITEMSTRUCT);
@@ -1918,6 +2410,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC => {
             let dc = HDC(wp.0 as _);
             let is_status = lp.0 == STATUS.load(std::sync::atomic::Ordering::Relaxed);
+            if lp.0 == FEED.load(std::sync::atomic::Ordering::Relaxed) {
+                SetTextColor(dc, COLORREF(DISABLED_TEXT));
+                SetBkColor(dc, COLORREF(BG));
+                return LRESULT(BRUSH_BG.load(std::sync::atomic::Ordering::Relaxed));
+            }
             SetTextColor(dc, COLORREF(TEXT));
             if is_status {
                 SetBkColor(dc, COLORREF(BG));
@@ -1936,7 +2433,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_REFRESH => {
             if wp.0 == 1 {
-                with(|ui| ui.busy = false);
+                with(|ui| unsafe {
+                    ui.busy = false;
+                    let _ = InvalidateRect(ui.ctl[&ID_PROGRESS], None, false);
+                });
             }
             refresh_lists();
             LRESULT(0)

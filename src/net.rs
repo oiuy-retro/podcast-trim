@@ -6,8 +6,8 @@ use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable,
     WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
     WinHttpSetOption, WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
-    WINHTTP_OPEN_REQUEST_FLAGS, WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_STATUS_CODE,
+    WINHTTP_OPEN_REQUEST_FLAGS, WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_QUERY_CONTENT_LENGTH,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
 };
 
 struct Parts {
@@ -64,11 +64,24 @@ pub fn get(url: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Stream to `dest` (via `dest.part`, renamed when complete).
-pub fn download(url: &str, dest: &std::path::Path) -> Result<(), String> {
+/// `progress(bytes so far, total if the server sent Content-Length)`
+/// returns false to cancel.
+pub fn download(
+    url: &str,
+    dest: &std::path::Path,
+    progress: &mut dyn FnMut(u64, Option<u64>) -> bool,
+) -> Result<(), String> {
     let part = dest.with_extension("part");
     let mut file = std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
-    let res = fetch(url, &mut |chunk| {
-        file.write_all(chunk).map_err(|e| e.to_string())
+    let mut got = 0u64;
+    let res = fetch_sized(url, &mut |chunk, total| {
+        file.write_all(chunk).map_err(|e| e.to_string())?;
+        got += chunk.len() as u64;
+        if progress(got, total) {
+            Ok(())
+        } else {
+            Err("Cancelled.".into())
+        }
     });
     drop(file);
     match res {
@@ -81,14 +94,17 @@ pub fn download(url: &str, dest: &std::path::Path) -> Result<(), String> {
 }
 
 fn fetch(url: &str, sink: &mut dyn FnMut(&[u8]) -> Result<(), String>) -> Result<(), String> {
+    fetch_sized(url, &mut |chunk, _| sink(chunk))
+}
+
+type Sink<'a> = dyn FnMut(&[u8], Option<u64>) -> Result<(), String> + 'a;
+
+fn fetch_sized(url: &str, sink: &mut Sink) -> Result<(), String> {
     let parts = split_url(url).ok_or_else(|| format!("Not an http(s) link: {url}"))?;
     unsafe { fetch_parts(&parts, sink) }
 }
 
-unsafe fn fetch_parts(
-    parts: &Parts,
-    sink: &mut dyn FnMut(&[u8]) -> Result<(), String>,
-) -> Result<(), String> {
+unsafe fn fetch_parts(parts: &Parts, sink: &mut Sink) -> Result<(), String> {
     let session = WinHttpOpen(
         w!("Podcast Trim"),
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
@@ -149,6 +165,20 @@ unsafe fn fetch_parts(
     if status >= 400 {
         return Err(format!("{} returned HTTP {status}.", parts.host));
     }
+    let mut total = 0u64;
+    let mut size = std::mem::size_of::<u64>() as u32;
+    // WINHTTP_QUERY_FLAG_NUMBER64: absent or chunked responses just leave it unknown.
+    let total = WinHttpQueryHeaders(
+        request,
+        WINHTTP_QUERY_CONTENT_LENGTH | 0x0800_0000,
+        None,
+        Some(std::ptr::addr_of_mut!(total).cast()),
+        &mut size,
+        std::ptr::null_mut(),
+    )
+    .ok()
+    .map(|_| total)
+    .filter(|t| *t > 0);
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
         let mut available = 0u32;
@@ -160,7 +190,7 @@ unsafe fn fetch_parts(
         let mut read = 0u32;
         WinHttpReadData(request, chunk.as_mut_ptr().cast(), want, &mut read)
             .map_err(|err| err.to_string())?;
-        sink(&chunk[..read as usize])?;
+        sink(&chunk[..read as usize], total)?;
     }
     Ok(())
 }

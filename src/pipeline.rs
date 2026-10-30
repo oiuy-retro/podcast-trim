@@ -3,6 +3,7 @@
 
 use crate::cutlist::{self, Cut};
 use crate::ffargs;
+use crate::progress;
 use crate::rss;
 use crate::store::{sha256_file, Episode, Paths, Settings, Show, State};
 use crate::transcript;
@@ -13,6 +14,39 @@ pub trait Env {
     fn fetch(&self, url: &str, dest: &Path) -> Result<(), String>;
     /// Run `program` with `args` (no shell) and return stdout.
     fn run(&self, program: &str, args: &[String]) -> Result<String, String>;
+    /// Like `run`, but hands every stdout and stderr line to `line` as it
+    /// arrives (for progress). The default just runs the program.
+    fn run_watch(
+        &self,
+        program: &str,
+        args: &[String],
+        line: &mut dyn FnMut(&str),
+    ) -> Result<String, String> {
+        let _ = line;
+        self.run(program, args)
+    }
+    /// Report what is happening and how far along it is (0..=1).
+    fn progress(&self, _stage: &str, _fraction: f64) {}
+}
+
+/// Run ffmpeg and report `-progress` output as a fraction of `total` seconds,
+/// mapped into `from..to`.
+fn ffmpeg_watch(
+    env: &dyn Env,
+    program: &str,
+    args: &[String],
+    stage: &str,
+    total: f64,
+    (from, to): (f64, f64),
+) -> Result<String, String> {
+    env.progress(stage, from);
+    env.run_watch(program, args, &mut |l| {
+        if let Some(t) = progress::ffmpeg_seconds(l) {
+            env.progress(stage, from + (to - from) * progress::fraction(t, total));
+        } else if progress::ffmpeg_done(l) {
+            env.progress(stage, to);
+        }
+    })
 }
 
 /// Add new episodes from a freshly fetched source feed. Returns how many were added.
@@ -78,8 +112,17 @@ pub fn transcribe(
     let orig = paths.original(show, ep);
     let wav = paths.work(show, ep, "wav");
     let base = paths.work(show, ep, "whisper");
-    env.run(&s.ffmpeg, &ffargs::wav_args(&orig, &wav))?;
-    let res = env.run(
+    ffmpeg_watch(
+        env,
+        &s.ffmpeg,
+        &ffargs::wav_args(&orig, &wav),
+        "Converting for whisper.cpp",
+        ep.record.duration,
+        (0.0, 0.05),
+    )?;
+    let stage = "Transcribing";
+    env.progress(stage, 0.05);
+    let res = env.run_watch(
         &s.whisper_cli,
         &ffargs::whisper_args(
             Path::new(&s.whisper_model),
@@ -88,6 +131,11 @@ pub fn transcribe(
             s.threads,
             &s.language,
         ),
+        &mut |l| {
+            if let Some(p) = progress::whisper_percent(l) {
+                env.progress(stage, 0.05 + 0.95 * p / 100.0);
+            }
+        },
     );
     let _ = fs::remove_file(&wav);
     res?;
@@ -122,7 +170,11 @@ pub fn apply_cuts(
     let orig = paths.original(show, ep);
     let out = paths.cleaned(show, ep);
     let args = ffargs::cut_args(&orig, &out, &cuts, ep.record.duration, s.bitrate_k, s.mono);
-    env.run(&s.ffmpeg, &args)?;
+    let kept = ep.record.duration - cuts.iter().map(|c| c.end - c.start).sum::<f64>();
+    if let Err(e) = ffmpeg_watch(env, &s.ffmpeg, &args, "Cutting", kept, (0.0, 1.0)) {
+        let _ = fs::remove_file(&out);
+        return Err(e);
+    }
     ep.cleaned_bytes = fs::metadata(&out)
         .map_err(|e| format!("ffmpeg wrote no file: {e}"))?
         .len();
@@ -211,6 +263,7 @@ mod tests {
     struct Fake {
         body: RefCell<Vec<u8>>,
         calls: RefCell<Vec<(String, Vec<String>)>>,
+        seen: RefCell<Vec<(String, f64)>>,
     }
 
     impl Env for Fake {
@@ -234,6 +287,25 @@ mod tests {
                 }
                 _ => Err("unknown".into()),
             }
+        }
+        fn run_watch(
+            &self,
+            program: &str,
+            args: &[String],
+            line: &mut dyn FnMut(&str),
+        ) -> Result<String, String> {
+            let out = self.run(program, args)?;
+            for l in [
+                "out_time_us=40000000",
+                "whisper: progress =  50%",
+                "progress=end",
+            ] {
+                line(l);
+            }
+            Ok(out)
+        }
+        fn progress(&self, stage: &str, fraction: f64) {
+            self.seen.borrow_mut().push((stage.into(), fraction));
         }
     }
 
@@ -260,6 +332,7 @@ mod tests {
             Fake {
                 body: RefCell::new(b"original".to_vec()),
                 calls: RefCell::new(vec![]),
+                seen: RefCell::new(vec![]),
             },
             s,
             Paths::new(root),
@@ -312,6 +385,31 @@ mod tests {
             whisper_before
         );
         assert!(paths.cleaned(1, &ep).exists());
+    }
+
+    #[test]
+    fn reports_progress() {
+        let (env, s, paths, mut ep) = setup("progress");
+        download(&env, &s, &paths, 1, &mut ep).unwrap();
+        transcribe(&env, &s, &paths, 1, &mut ep).unwrap();
+        let seen = env.seen.borrow().clone();
+        // 40 s of 100 s converted is 40% of the 5% conversion share.
+        assert!(seen
+            .iter()
+            .any(|(st, f)| st.starts_with("Converting") && (*f - 0.02).abs() < 1e-9));
+        assert!(seen
+            .iter()
+            .any(|(st, f)| st == "Transcribing" && (*f - 0.525).abs() < 1e-9));
+        env.seen.borrow_mut().clear();
+        let cuts = check_reply(&ep, "00:00:00.000-00:00:20.000").unwrap();
+        apply_cuts(&env, &s, &paths, 1, &mut ep, cuts).unwrap();
+        // 40 s of the 80 s kept.
+        assert!(env
+            .seen
+            .borrow()
+            .iter()
+            .any(|(st, f)| st == "Cutting" && (*f - 0.5).abs() < 1e-9));
+        assert_eq!(env.seen.borrow().last().unwrap().1, 1.0);
     }
 
     #[test]

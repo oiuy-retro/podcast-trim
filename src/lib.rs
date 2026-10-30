@@ -2,6 +2,7 @@
 pub mod cutlist;
 pub mod ffargs;
 pub mod pipeline;
+pub mod progress;
 pub mod prompt;
 pub mod rss;
 pub mod server;

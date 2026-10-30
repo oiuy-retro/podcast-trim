@@ -60,13 +60,14 @@ pub fn cut_args(
     if mono {
         args.extend(["-ac".into(), "1".into()]);
     }
+    args.extend(progress_args());
     args.extend(["-f".into(), "ogg".into(), s(output)]);
     args
 }
 
 /// 16 kHz mono PCM WAV, the input whisper.cpp expects.
 pub fn wav_args(input: &Path, wav: &Path) -> Vec<String> {
-    vec![
+    [
         "-hide_banner".into(),
         "-nostdin".into(),
         "-y".into(),
@@ -79,8 +80,16 @@ pub fn wav_args(input: &Path, wav: &Path) -> Vec<String> {
         "1".into(),
         "-c:a".into(),
         "pcm_s16le".into(),
-        s(wav),
     ]
+    .into_iter()
+    .chain(progress_args())
+    .chain([s(wav)])
+    .collect()
+}
+
+/// Machine-readable progress on stdout (`out_time_us=...`), no stats on stderr.
+fn progress_args() -> [String; 3] {
+    ["-progress".into(), "pipe:1".into(), "-nostats".into()]
 }
 
 pub fn probe_args(input: &Path) -> Vec<String> {
@@ -116,6 +125,7 @@ pub fn whisper_args(
         } else {
             language.trim().into()
         },
+        "-pp".into(),
         "-osrt".into(),
         "-of".into(),
         s(out_base),
@@ -174,6 +184,12 @@ mod tests {
         assert!(a.windows(2).any(|w| w[0] == "-ac" && w[1] == "1"));
         assert!(a.windows(2).any(|w| w[0] == "-f" && w[1] == "ogg"));
         assert!(a.contains(&"64k".to_string()));
+        assert!(a
+            .windows(2)
+            .any(|w| w[0] == "-progress" && w[1] == "pipe:1"));
+        let w = wav_args(&PathBuf::from("i"), &PathBuf::from("o.wav"));
+        assert_eq!(w.last().unwrap(), "o.wav");
+        assert!(w.contains(&"-nostats".to_string()));
     }
 
     #[test]
@@ -200,7 +216,7 @@ mod tests {
         );
         assert_eq!(
             a,
-            ["-m", "m.bin", "-f", "a.wav", "-t", "1", "-l", "auto", "-osrt", "-of", "a"]
+            ["-m", "m.bin", "-f", "a.wav", "-t", "1", "-l", "auto", "-pp", "-osrt", "-of", "a"]
         );
         assert!(display("ffmpeg", &["-i".into(), "a b".into()]).ends_with("\"a b\""));
     }
