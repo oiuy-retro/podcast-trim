@@ -64,13 +64,21 @@ fn real_tools() {
     let cuts = pipeline::check_reply(&ep, "00:00:02.000-00:00:04.000").unwrap();
     pipeline::apply_cuts(&env, &s, &paths, 1, &mut ep, cuts).unwrap();
     let out = paths.cleaned(1, &ep);
-    let d: f64 = env
+    let probed = env
         .run(&s.ffprobe, &podcast_trim::ffargs::probe_args(&out))
-        .unwrap()
-        .trim()
-        .parse()
         .unwrap();
-    println!("cleaned duration {d}");
+    let (codec, _, d) = podcast_trim::bitrate::parse_probe(&probed);
+    let d = d.unwrap();
+    println!(
+        "cleaned duration {d}, source {} {:?} -> opus {} kbps",
+        ep.record.codec, ep.record.source_kbps, ep.record.opus_kbps
+    );
+    assert_eq!(codec, "opus");
+    assert_eq!(ep.record.codec, "mp3");
+    assert_eq!(
+        ep.record.opus_kbps,
+        podcast_trim::bitrate::cut_kbps("mp3", ep.record.source_kbps)
+    );
     assert!((d - (ep.record.duration - 2.0)).abs() < 0.2);
     assert_eq!(&std::fs::read(&out).unwrap()[..4], b"OggS");
     pipeline::mark_delivered(&paths, 1, &mut ep);

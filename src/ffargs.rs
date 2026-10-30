@@ -96,10 +96,10 @@ pub fn probe_args(input: &Path) -> Vec<String> {
     vec![
         "-v".into(),
         "error".into(),
+        "-select_streams".into(),
+        "a:0".into(),
         "-show_entries".into(),
-        "format=duration".into(),
-        "-of".into(),
-        "default=noprint_wrappers=1:nokey=1".into(),
+        "stream=codec_name,bit_rate:format=duration,bit_rate".into(),
         s(input),
     ]
 }

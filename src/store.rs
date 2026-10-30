@@ -26,7 +26,7 @@ pub struct Settings {
     /// Address the phone uses to reach this PC; written into feed links.
     pub public_host: String,
     pub require_token: bool,
-    /// Opus bitrate in kbit/s.
+    /// Opus bitrate in kbit/s; 0 = Auto (picked from the source, see bitrate.rs).
     pub bitrate_k: u32,
     /// Downmix trimmed episodes to mono.
     pub mono: bool,
@@ -48,7 +48,7 @@ impl Default for Settings {
             port: 8737,
             public_host: String::new(),
             require_token: true,
-            bitrate_k: 64,
+            bitrate_k: 0,
             mono: false,
             export_dir: String::new(),
         }
@@ -76,6 +76,13 @@ pub struct Record {
     pub cuts: Vec<Cut>,
     /// The exact ffmpeg arguments used, kept for reference.
     pub ffmpeg_args: Vec<String>,
+    /// Source audio codec and bitrate from ffprobe, and the Opus bitrate used.
+    #[serde(default)]
+    pub codec: String,
+    #[serde(default)]
+    pub source_kbps: Option<u32>,
+    #[serde(default)]
+    pub opus_kbps: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -181,6 +188,26 @@ pub fn sha256_file(path: &Path) -> Result<(String, u64), String> {
 }
 
 /// Where everything lives: `%AppData%\Podcast Trim` on Windows.
+/// "1 episode", "2 episodes".
+pub fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
+    }
+}
+
+/// This PC's LAN IPv4 address: the source address the OS would use to reach
+/// the internet. A UDP "connect" only picks a route; nothing is sent.
+pub fn lan_ipv4() -> Option<std::net::Ipv4Addr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("192.0.2.1:9").ok()?;
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+        _ => None,
+    }
+}
+
 pub fn data_dir() -> PathBuf {
     if let Ok(d) = std::env::var("PODCAST_TRIM_DATA") {
         return PathBuf::from(d);
@@ -259,6 +286,13 @@ mod tests {
     }
 
     #[test]
+    fn plurals() {
+        assert_eq!(plural(1, "episode"), "1 episode");
+        assert_eq!(plural(0, "episode"), "0 episodes");
+        assert_eq!(plural(2, "new episode"), "2 new episodes");
+    }
+
+    #[test]
     fn library_roundtrip() {
         let mut lib = Library::default();
         let a = lib.add_show("A".into(), "u".into());
@@ -271,6 +305,6 @@ mod tests {
         let back: Library = load_json(&p);
         assert_eq!(back.show(2).unwrap().title, "B");
         let s: Settings = serde_json::from_str("{\"port\":1}").unwrap();
-        assert_eq!((s.port, s.bitrate_k, s.mono), (1, 64, false));
+        assert_eq!((s.port, s.bitrate_k, s.mono), (1, 0, false));
     }
 }

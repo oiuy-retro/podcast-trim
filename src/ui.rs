@@ -54,6 +54,9 @@ const fn rgb(r: u8, g: u8, b: u8) -> u32 {
 const WM_REFRESH: u32 = WM_APP + 1;
 /// A worker reported progress; repaint the bar and the status line.
 const WM_PROGRESS: u32 = WM_APP + 2;
+/// The model drop-down list was closed on item `wparam`.
+const WM_MODEL_PICK: u32 = WM_APP + 3;
+const DROP_ROW: i32 = 18;
 
 // Control ids
 const ID_SHOWS: i32 = 100;
@@ -125,6 +128,10 @@ struct Ui {
     anchor: Anchor,
     items: Vec<Placed>,
     feed_frame: usize,
+    /// Companion tools missing from the exe folder, as a full message.
+    missing: String,
+    /// Detected LAN address, used when "PC address for phone" is blank.
+    lan: Option<std::net::Ipv4Addr>,
 }
 
 /// How an element follows the window size: fractions of the extra width
@@ -466,6 +473,14 @@ pub fn run() -> i32 {
             ..Default::default()
         });
         RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(drop_proc),
+            hInstance: instance,
+            lpszClassName: w!("PodcastTrimDrop"),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            style: CS_DROPSHADOW,
+            ..Default::default()
+        });
+        RegisterClassW(&WNDCLASSW {
             lpfnWndProc: Some(progress_proc),
             hInstance: instance,
             lpszClassName: w!("PodcastTrimProgress"),
@@ -532,6 +547,8 @@ pub fn run() -> i32 {
             anchor: FIXED,
             items: vec![],
             feed_frame: usize::MAX,
+            missing: String::new(),
+            lan: store::lan_ipv4(),
             icon: LoadImageW(
                 instance,
                 PCWSTR(1 as _),
@@ -565,7 +582,14 @@ pub fn run() -> i32 {
                 if miss.is_empty() {
                     status(ui, &format!("Feed server listening on {addr}."));
                 } else {
-                    status(ui, &podcast_trim::tools::missing_message(&dir, &miss));
+                    ui.missing = podcast_trim::tools::missing_message(&dir, &miss);
+                    status(
+                        ui,
+                        &format!(
+                            "{} missing next to Podcast Trim.exe. The list is in Details.",
+                            store::plural(miss.len(), "file")
+                        ),
+                    );
                 }
             }
             Err(e) => status(ui, &e),
@@ -1081,7 +1105,11 @@ fn build_controls(instance: HINSTANCE) {
             s.bind,
             s.port.to_string(),
             s.public_host,
-            s.bitrate_k.to_string(),
+            if s.bitrate_k == 0 {
+                "Auto".to_string()
+            } else {
+                s.bitrate_k.to_string()
+            },
             s.export_dir,
         ];
         for (i, v) in vals.iter().enumerate() {
@@ -1193,7 +1221,12 @@ fn feed_link(ui: &Ui, sh: &Shared, id: u32) -> String {
             .next()
             .unwrap_or("8737")
             .to_string();
-        format!("<this-pc-address>:{port}")
+        match ui.lan {
+            Some(ip) => format!("{ip}:{port}"),
+            None => {
+                return "This PC's network address was not found. Enter it as \"PC address for phone\" in Options.".into()
+            }
+        }
     } else if sh.settings.public_host.contains(':') {
         sh.settings.public_host.trim().to_string()
     } else {
@@ -1281,6 +1314,7 @@ fn show_details() {
             .and_then(|s| sh.lib.show(s))
             .and_then(|s| s.episodes.iter().find(|e| Some(&e.guid) == guid.as_ref()));
         let text = match ep {
+            None if !ui.missing.is_empty() => ui.missing.clone(),
             None => {
                 "Add a show with its RSS link, pick an episode, then press Download + transcribe."
                     .to_string()
@@ -1292,6 +1326,28 @@ fn show_details() {
                         "Length {}\nSHA-256 {}\n",
                         format_time(e.record.duration),
                         e.record.sha256
+                    ));
+                }
+                if !e.record.codec.is_empty() {
+                    let src = match e.record.source_kbps {
+                        Some(k) => format!("{} {k} kbps", e.record.codec),
+                        None => e.record.codec.clone(),
+                    };
+                    let (kbps, auto) = if e.record.opus_kbps > 0 {
+                        (e.record.opus_kbps, false)
+                    } else {
+                        pipeline::target_kbps(&sh.settings, e)
+                    };
+                    let how = if e.record.opus_kbps > 0 {
+                        ""
+                    } else if auto {
+                        " (Auto)"
+                    } else {
+                        " (set in Options)"
+                    };
+                    t.push_str(&format!(
+                        "Source {src}, Opus {kbps} kbps{how}{}\n",
+                        if sh.settings.mono { ", mono" } else { "" }
                     ));
                 }
                 match e.state {
@@ -1364,11 +1420,7 @@ fn update_buttons() {
                 .iter()
                 .find(|m| m.eq_ignore_ascii_case(&ui.model))
                 .unwrap_or(&ui.models[0]);
-            if ui.models.len() > 1 {
-                format!("{cur}  ({} found, click to switch)", ui.models.len())
-            } else {
-                cur.clone()
-            }
+            cur.clone()
         };
         let mw = wide(&model);
         let _ = SetWindowTextW(ui.ctl[&B_MODEL], PCWSTR(mw.as_ptr()));
@@ -1488,7 +1540,11 @@ fn on_command(id: i32, code: u32) {
                 let id = sh.lib.add_show(feed.title.clone(), url);
                 let show = sh.lib.show_mut(id).unwrap();
                 let n = pipeline::merge_feed(show, &feed);
-                Ok(format!("Added {} with {n} episodes.", feed.title))
+                Ok(format!(
+                    "Added {} with {}.",
+                    feed.title,
+                    store::plural(n, "episode")
+                ))
             });
             with(|ui| set_text(ui.ctl[&ID_URL], ""));
         }
@@ -1506,7 +1562,11 @@ fn on_command(id: i32, code: u32) {
                 let mut sh = shared.lock().unwrap();
                 let s = sh.lib.show_mut(show).ok_or("show is gone")?;
                 let n = pipeline::merge_feed(s, &feed);
-                Ok(format!("{n} new episode(s)."))
+                Ok(if n == 0 {
+                    "No new episodes.".to_string()
+                } else {
+                    format!("{}.", store::plural(n, "new episode"))
+                })
             });
         }
         B_PROCESS => {
@@ -1572,7 +1632,7 @@ fn on_command(id: i32, code: u32) {
                             &paths.cleaned(show.unwrap(), &ep),
                             &cuts,
                             ep.record.duration,
-                            settings.bitrate_k,
+                            pipeline::target_kbps(&settings, &ep).0,
                             settings.mono,
                         );
                         let mut t = format!(
@@ -1638,8 +1698,20 @@ fn on_command(id: i32, code: u32) {
             let (Some(show), Some(guid)) = (show, guid) else {
                 return;
             };
+            // Folder picker first (modal, re-enters the window procedure),
+            // starting in the last folder used.
+            let last = with(|ui| ui.shared.lock().unwrap().settings.export_dir.clone())
+                .unwrap_or_default();
+            let Some(picked) = (unsafe { pick_folder(hwnd, &last) }) else {
+                return;
+            };
             with(|ui| {
-                let sh = ui.shared.lock().unwrap();
+                let mut sh = ui.shared.lock().unwrap();
+                sh.settings.export_dir = picked.clone();
+                let _ = save_json(&sh.paths.settings(), &sh.settings);
+                if let Some(h) = ui.ctl.get(&(OPT_BASE + 6)) {
+                    set_text(*h, &picked);
+                }
                 let dir = sh.settings.export_dir.clone();
                 let ep = sh
                     .lib
@@ -1649,7 +1721,7 @@ fn on_command(id: i32, code: u32) {
                 let paths = Paths::new(sh.paths.root.clone());
                 drop(sh);
                 let msg = match (dir.trim().is_empty(), ep) {
-                    (true, _) => "Set an export folder in Options first.".to_string(),
+                    (true, _) => "No folder was chosen.".to_string(),
                     (false, Some(ep)) => {
                         match pipeline::export(&paths, show, &ep, Path::new(dir.trim())) {
                             Ok(p) => format!("Saved {}", p.display()),
@@ -1665,7 +1737,7 @@ fn on_command(id: i32, code: u32) {
             with(|ui| {
                 let link = get_text(ui.ctl[&ID_FEED]);
                 copy_to_clipboard(hwnd, &link);
-                status(ui, "Feed link copied. Replace <this-pc-address> with this PC's address if shown, or set it in Options.");
+                status(ui, "Feed link copied. Add it to your podcast app.");
             });
         }
         B_CANCEL => {
@@ -1685,16 +1757,15 @@ fn on_command(id: i32, code: u32) {
             update_buttons();
         }
         B_MODEL => {
-            with(|ui| {
+            let info = with(|ui| {
                 ui.models = podcast_trim::tools::models(&podcast_trim::tools::exe_dir());
-                if !ui.models.is_empty() {
-                    let i = ui
-                        .models
-                        .iter()
-                        .position(|m| m.eq_ignore_ascii_case(&ui.model));
-                    ui.model = ui.models[i.map(|i| (i + 1) % ui.models.len()).unwrap_or(0)].clone();
-                }
+                (ui.models.clone(), ui.model.clone(), ui.ctl[&B_MODEL])
             });
+            if let Some((models, cur, btn)) = info {
+                if !models.is_empty() {
+                    unsafe { open_dropdown(btn, models, &cur) };
+                }
+            }
             update_buttons();
         }
         B_TOKEN => {
@@ -1716,11 +1787,15 @@ fn on_command(id: i32, code: u32) {
                 s.bind = v[2].clone();
                 s.port = v[3].parse().unwrap_or(s.port);
                 s.public_host = v[4].clone();
-                s.bitrate_k = v[5]
-                    .parse::<u32>()
-                    .ok()
-                    .filter(|b| (6..=256).contains(b))
-                    .unwrap_or(s.bitrate_k);
+                s.bitrate_k = if v[5].is_empty() || v[5].eq_ignore_ascii_case("auto") {
+                    0
+                } else {
+                    v[5].trim_end_matches(['k', 'K'])
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|b| *b == 0 || (6..=256).contains(b))
+                        .unwrap_or(s.bitrate_k)
+                };
                 s.export_dir = v[6].clone();
                 s.require_token = ui.token_on;
                 let restart = old_bind != (s.bind.clone(), s.port);
@@ -1860,10 +1935,11 @@ unsafe fn paint(hwnd: HWND) {
             text(dc, s, &mut r, TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         }
         if ui.options {
-            let mut r = sr(ui, 28, 380, cw - 60, 80);
+            let mut r = sr(ui, 28, 380, cw - 60, 110);
             let note = format!(
-                "Note: ffmpeg.exe, ffprobe.exe, whisper-cli.exe with its DLLs, and ggml-*.bin models must be in the same folder as Podcast Trim.exe.\nThe feed server is listening on {}. Use 0.0.0.0 to reach it from your phone on the same network, or 127.0.0.1 for this PC only. Address and port changes need a restart.",
-                ui.server_addr
+                "Note: ffmpeg.exe, ffprobe.exe, whisper-cli.exe with its DLLs, and ggml-*.bin models must be in the same folder as Podcast Trim.exe.\nThe feed server is listening on {}. Use 0.0.0.0 to reach it from your phone on the same network, or 127.0.0.1 for this PC only. Address and port changes need a restart.\nPC address for phone: leave it blank to use this PC's detected address ({}). Opus bitrate: Auto picks it from each episode's source (as Opus Convert does), or enter a number from 6 to 256.",
+                ui.server_addr,
+                ui.lan.map(|i| i.to_string()).unwrap_or_else(|| "none found".into())
             );
             text(
                 dc,
@@ -1876,6 +1952,172 @@ unsafe fn paint(hwnd: HWND) {
         SelectObject(dc, old);
     });
     let _ = EndPaint(hwnd, &ps);
+}
+
+thread_local! {
+    /// Open model list: (items, hovered row, current row).
+    static DROP: RefCell<(Vec<String>, i32, i32)> = const { RefCell::new((Vec::new(), -1, -1)) };
+}
+
+/// Drop-down list under the model field, drawn like the VGUI combo boxes:
+/// a dark-edged field-coloured list with a mustard highlight row.
+unsafe fn open_dropdown(btn: HWND, items: Vec<String>, current: &str) {
+    let d = DPI.load(std::sync::atomic::Ordering::Relaxed);
+    let mut r = RECT::default();
+    let _ = GetWindowRect(btn, &mut r);
+    let cur = items
+        .iter()
+        .position(|m| m.eq_ignore_ascii_case(current))
+        .map(|i| i as i32)
+        .unwrap_or(-1);
+    let h = scale(DROP_ROW, d) * items.len() as i32 + 2;
+    DROP.with(|x| *x.borrow_mut() = (items, cur, cur));
+    let instance: HINSTANCE = GetModuleHandleW(None).map(Into::into).unwrap_or_default();
+    let main = HWND(MAIN.load(std::sync::atomic::Ordering::Relaxed) as _);
+    let Ok(pop) = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        w!("PodcastTrimDrop"),
+        None,
+        WS_POPUP,
+        r.left,
+        r.bottom,
+        r.right - r.left,
+        h,
+        main,
+        None,
+        instance,
+        None,
+    ) else {
+        return;
+    };
+    let _ = ShowWindow(pop, SW_SHOWNOACTIVATE);
+    windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(pop);
+}
+
+unsafe extern "system" fn drop_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let d = DPI.load(std::sync::atomic::Ordering::Relaxed);
+    let row = scale(DROP_ROW, d);
+    let x = (lp.0 & 0xffff) as i16 as i32;
+    let y = ((lp.0 >> 16) & 0xffff) as i16 as i32;
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    let inside = x >= 0 && y >= 0 && x < rc.right && y < rc.bottom;
+    match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let dc = BeginPaint(hwnd, &mut ps);
+            fill(dc, &rc, FIELD);
+            let old = SelectObject(dc, font());
+            DROP.with(|x| {
+                let (items, hover, cur) = &*x.borrow();
+                for (i, it) in items.iter().enumerate() {
+                    let i = i as i32;
+                    let r = RECT {
+                        left: 1,
+                        top: 1 + i * row,
+                        right: rc.right - 1,
+                        bottom: 1 + (i + 1) * row,
+                    };
+                    let on = i == *hover;
+                    if on {
+                        fill(dc, &r, SEL);
+                    }
+                    let mut tr = RECT {
+                        left: r.left + scale(5, d),
+                        ..r
+                    };
+                    let color = if on {
+                        rgb(255, 255, 255)
+                    } else if i == *cur {
+                        TAN
+                    } else {
+                        TEXT
+                    };
+                    text(dc, it, &mut tr, color, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                }
+            });
+            SelectObject(dc, old);
+            // Dark outline on all sides, as on the VGUI menus.
+            let p = CreatePen(PS_SOLID, 1, COLORREF(DARK));
+            let o = SelectObject(dc, p);
+            line(dc, 0, 0, rc.right - 1, 0);
+            line(dc, rc.right - 1, 0, rc.right - 1, rc.bottom - 1);
+            line(dc, rc.right - 1, rc.bottom - 1, 0, rc.bottom - 1);
+            line(dc, 0, rc.bottom - 1, 0, 0);
+            SelectObject(dc, o);
+            let _ = DeleteObject(p);
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_MOUSEMOVE => {
+            let h = if inside { (y - 1) / row } else { -1 };
+            let changed = DROP.with(|x| {
+                let mut g = x.borrow_mut();
+                let c = g.1 != h;
+                g.1 = h;
+                c
+            });
+            if changed {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
+            let n = DROP.with(|x| x.borrow().0.len()) as i32;
+            let pick = if inside { (y - 1) / row } else { -1 };
+            if (0..n).contains(&pick) {
+                let main = HWND(MAIN.load(std::sync::atomic::Ordering::Relaxed) as _);
+                let _ = PostMessageW(main, WM_MODEL_PICK, WPARAM(pick as usize), LPARAM(0));
+            }
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_KEYDOWN if wp.0 == 0x1B => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            if HWND(lp.0 as _) != hwnd {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// Standard Windows folder picker, starting in `start` if it exists.
+unsafe fn pick_folder(owner: HWND, start: &str) -> Option<String> {
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{
+        FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName,
+        FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
+    };
+    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    let dlg: IFileOpenDialog =
+        CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+    let opts = dlg.GetOptions().ok()?;
+    dlg.SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)
+        .ok()?;
+    let _ = dlg.SetTitle(w!("Export Opus to folder"));
+    if !start.trim().is_empty() && Path::new(start.trim()).is_dir() {
+        let ws = wide(start.trim());
+        if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(ws.as_ptr()), None)
+        {
+            let _ = dlg.SetFolder(&item);
+        }
+    }
+    dlg.Show(owner).ok()?;
+    let item = dlg.GetResult().ok()?;
+    let p = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+    let out = p.to_string().ok();
+    CoTaskMemFree(Some(p.0 as _));
+    out
 }
 
 /// VGUI resize grip: three light diagonals with dark shadows in the corner.
@@ -2380,6 +2622,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_SIZE => {
             layout();
+            LRESULT(0)
+        }
+        WM_MODEL_PICK => {
+            with(|ui| {
+                if let Some(m) = ui.models.get(wp.0) {
+                    ui.model = m.clone();
+                }
+            });
+            update_buttons();
             LRESULT(0)
         }
         WM_PROGRESS => {

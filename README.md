@@ -9,11 +9,11 @@ Windows app that cuts ads out of podcast episodes using a local Whisper transcri
 3. **Copy AI prompt** copies a ready-made prompt plus the transcript to the clipboard. Paste it into any AI chat. No AI service is built in and nothing is sent anywhere by the app.
 4. Paste the AI's reply into the reply box and press **Check cuts**. The reply must be a list of ad time ranges (format below). Podcast Trim never runs commands from the reply. It checks that every range is inside the episode, ends after it starts, and does not overlap another range, then shows the cut list and the exact ffmpeg command it will run.
 5. **Approve and cut** runs ffmpeg itself (as an argument list, without a shell) and writes an Ogg Opus file (`.opus`) without the ads. The original download is deleted.
-6. The trimmed episode appears in that show's feed at `http://<this-pc>:8737/feed/<show-id>.xml`. Subscribe to that link in AntennaPod or another podcast app.
+6. The trimmed episode appears in that show's feed at `http://<this-pc>:8737/feed/<show-id>.xml`. The link uses this PC's detected network address unless **PC address for phone** is set in Options. Subscribe to that link in AntennaPod or another podcast app.
 7. Once a client has downloaded every byte of a trimmed file, the file is deleted and the episode is marked SENT. The app keeps the hash, the transcript, the cut list, and the ffmpeg arguments.
 8. **Regenerate** on a SENT episode downloads the original again, checks that its hash matches, and rebuilds the trimmed file from the saved cuts without transcribing again or asking the AI again. If the publisher has changed the file (for example, new ads were inserted), the hash will not match, the old cuts are discarded, and the episode goes back to the transcribe step.
 
-**Export Opus** copies a trimmed episode to the export folder set in Options, for use without the feed.
+**Export Opus...** asks for a folder (it starts in the last one used) and copies the trimmed episode there, for use without the feed.
 
 ## AI reply format
 
@@ -42,7 +42,17 @@ Anything else is rejected with the line number of the problem.
 
 ## Audio format
 
-Trimmed episodes are Ogg Opus (`.opus`, encoded with libopus), 64 kbit/s variable bitrate by default, which is plenty for speech. The bitrate (6 to 256 kbit/s) and a **Mono** switch are in Options. Feeds list them with the MIME type `audio/ogg`, the registered type for Ogg Opus files (RFC 7845). AntennaPod plays them through its built-in player (ExoPlayer) on Android 5 and later.
+Trimmed episodes are Ogg Opus (`.opus`, encoded with libopus, variable bitrate). With **Opus bitrate** set to Auto (the default) the bitrate is picked from the original with ffprobe, using the same table as Opus Convert:
+
+| Source | Opus bitrate |
+| --- | --- |
+| Opus | its own bitrate, rounded up to 24, 32, 48, 64, 96, 128, 160 or 192k (cutting always re-encodes, so it can't be copied) |
+| Lossless, DTS | 192k |
+| MP3/WMA | ≤128 → 96k, 129–192 → 128k, 193–256 → 160k, 257+ → 192k |
+| AAC/Vorbis | ≤128 → 96k, 129–192 → 128k, 193+ → 160k |
+| AC-3 | ≤192 → 128k, 193–384 → 160k, 385+ → 192k |
+
+Details shows the source codec and bitrate and the Opus bitrate chosen. A fixed bitrate (6 to 256 kbit/s) and a **Mono** switch are in Options. Feeds list them with the MIME type `audio/ogg`, the registered type for Ogg Opus files (RFC 7845). AntennaPod plays them through its built-in player (ExoPlayer) on Android 5 and later.
 
 ## Run
 
@@ -56,7 +66,7 @@ Everything Podcast Trim needs must be in the same folder as `Podcast Trim.exe`:
 
 1. Put `Podcast Trim.exe` and the files above in one folder.
 2. Start `Podcast Trim.exe`. If anything is missing, the status line lists what is missing and where it goes, and transcribing and cutting stay unavailable until it is there.
-3. If there is more than one model in the folder, press **Options**, click the **Whisper model** button to switch between them, and press **Save**. Larger models are more accurate and slower on the CPU. `base.en` or `small.en` is a reasonable start for English shows.
+3. If there is more than one model in the folder, press **Options**, open the **Whisper model** list and pick one, and press **Save**. Larger models are more accurate and slower on the CPU. `base.en` or `small.en` is a reasonable start for English shows.
 
 Settings, the show list, and episode records are stored in `%AppData%\Podcast Trim`. Set the `PODCAST_TRIM_DATA` environment variable to use another folder.
 

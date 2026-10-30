@@ -1,6 +1,7 @@
 //! Episode steps: download, transcribe, cut, deliver, regenerate, export.
 //! Network and process calls go through `Env` so the logic is testable.
 
+use crate::bitrate;
 use crate::cutlist::{self, Cut};
 use crate::ffargs;
 use crate::progress;
@@ -77,11 +78,28 @@ pub fn merge_feed(show: &mut Show, feed: &rss::SourceFeed) -> usize {
     added
 }
 
-fn probe(env: &dyn Env, s: &Settings, file: &Path) -> Result<f64, String> {
+/// Read duration, codec and bitrate of the original into the record.
+fn probe(env: &dyn Env, s: &Settings, file: &Path, ep: &mut Episode) -> Result<(), String> {
     let out = env.run(&s.ffprobe, &ffargs::probe_args(file))?;
-    out.trim()
-        .parse::<f64>()
-        .map_err(|_| format!("ffprobe gave no duration: `{}`", out.trim()))
+    let (codec, kbps, dur) = bitrate::parse_probe(&out);
+    ep.record.duration =
+        dur.ok_or_else(|| format!("ffprobe gave no duration: `{}`", out.trim()))?;
+    ep.record.codec = codec;
+    ep.record.source_kbps = kbps;
+    Ok(())
+}
+
+/// Opus bitrate for this episode: the Options value, or picked from the
+/// source when Options says Auto (0). Returns (kbps, auto).
+pub fn target_kbps(s: &Settings, ep: &Episode) -> (u32, bool) {
+    if s.bitrate_k == 0 {
+        (
+            bitrate::cut_kbps(&ep.record.codec, ep.record.source_kbps),
+            true,
+        )
+    } else {
+        (s.bitrate_k, false)
+    }
 }
 
 pub fn download(
@@ -97,7 +115,7 @@ pub fn download(
     let (hash, bytes) = sha256_file(&orig)?;
     ep.record.sha256 = hash;
     ep.record.source_bytes = bytes;
-    ep.record.duration = probe(env, s, &orig)?;
+    probe(env, s, &orig, ep)?;
     ep.state = State::Downloaded;
     Ok(())
 }
@@ -169,7 +187,8 @@ pub fn apply_cuts(
 ) -> Result<(), String> {
     let orig = paths.original(show, ep);
     let out = paths.cleaned(show, ep);
-    let args = ffargs::cut_args(&orig, &out, &cuts, ep.record.duration, s.bitrate_k, s.mono);
+    let (kbps, _) = target_kbps(s, ep);
+    let args = ffargs::cut_args(&orig, &out, &cuts, ep.record.duration, kbps, s.mono);
     let kept = ep.record.duration - cuts.iter().map(|c| c.end - c.start).sum::<f64>();
     if let Err(e) = ffmpeg_watch(env, &s.ffmpeg, &args, "Cutting", kept, (0.0, 1.0)) {
         let _ = fs::remove_file(&out);
@@ -180,6 +199,7 @@ pub fn apply_cuts(
         .len();
     ep.record.cuts = cuts;
     ep.record.ffmpeg_args = args;
+    ep.record.opus_kbps = kbps;
     ep.state = State::Ready;
     let _ = fs::remove_file(&orig);
     Ok(())
@@ -212,7 +232,7 @@ pub fn regenerate(
         // Publisher changed the file (often new dynamic ads). Old cuts don't apply.
         ep.record.sha256 = hash;
         ep.record.source_bytes = fs::metadata(&orig).map(|m| m.len()).unwrap_or(0);
-        ep.record.duration = probe(env, s, &orig)?;
+        probe(env, s, &orig, ep)?;
         ep.record.transcript.clear();
         ep.record.cuts.clear();
         ep.record.ffmpeg_args.clear();
