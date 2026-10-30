@@ -85,7 +85,7 @@ const ID_PROGRESS: i32 = 107;
 const B_TOKEN: i32 = 212;
 const OPT_BASE: i32 = 300;
 
-const B_MONO: i32 = 213;
+const B_CHANNELS: i32 = 213;
 const B_MODEL: i32 = 214;
 
 /// Edit rows on the Options page; row 0 is the model picker button.
@@ -114,7 +114,7 @@ struct Ui {
     busy: bool,
     options: bool,
     token_on: bool,
-    mono_on: bool,
+    channels: store::Channels,
     models: Vec<String>,
     model: String,
     server_addr: String,
@@ -419,7 +419,7 @@ pub fn run() -> i32 {
     let paths = Paths::new(store::data_dir());
     let _ = std::fs::create_dir_all(&paths.root);
     let settings: Settings = if paths.settings().exists() {
-        load_json(&paths.settings())
+        load_json::<Settings>(&paths.settings()).migrate()
     } else {
         Settings::default()
     };
@@ -436,7 +436,7 @@ pub fn run() -> i32 {
         .next_id
         .max(lib.shows.iter().map(|s| s.id + 1).max().unwrap_or(1));
     let token_on = settings.require_token;
-    let mono_on = settings.mono;
+    let channels = settings.channels;
     let model = settings.whisper_model.clone();
     let shared: SharedRef = Arc::new(Mutex::new(Shared {
         lib,
@@ -537,7 +537,7 @@ pub fn run() -> i32 {
             busy: false,
             options: false,
             token_on,
-            mono_on,
+            channels,
             models: podcast_trim::tools::models(&podcast_trim::tools::exe_dir()),
             model,
             server_addr: String::new(),
@@ -1134,18 +1134,19 @@ fn build_controls(instance: HINSTANCE) {
             BTN,
             B_TOKEN,
             o,
-            (220, 340, 200, 20),
+            (220, 368, 200, 20),
         );
+        label(ui, "Channels", o, 28, 332, 180);
         child(
             ui,
             instance,
             ui.hwnd,
             bt,
-            "Mono",
+            "",
             BTN,
-            B_MONO,
+            B_CHANNELS,
             o,
-            (440, 340, 120, 20),
+            (220, 328, 420, 22),
         );
         ui.anchor = Anchor(1.0, 1.0, 0.0, 0.0);
         button(ui, instance, "Save", B_SAVE, o, 796, 72, 80);
@@ -1329,26 +1330,7 @@ fn show_details() {
                     ));
                 }
                 if !e.record.codec.is_empty() {
-                    let src = match e.record.source_kbps {
-                        Some(k) => format!("{} {k} kbps", e.record.codec),
-                        None => e.record.codec.clone(),
-                    };
-                    let (kbps, auto) = if e.record.opus_kbps > 0 {
-                        (e.record.opus_kbps, false)
-                    } else {
-                        pipeline::target_kbps(&sh.settings, e)
-                    };
-                    let how = if e.record.opus_kbps > 0 {
-                        ""
-                    } else if auto {
-                        " (Auto)"
-                    } else {
-                        " (set in Options)"
-                    };
-                    t.push_str(&format!(
-                        "Source {src}, Opus {kbps} kbps{how}{}\n",
-                        if sh.settings.mono { ", mono" } else { "" }
-                    ));
+                    t.push_str(&format!("{}\n", source_line(e, &sh.settings)));
                 }
                 match e.state {
                     State::New => t.push_str("\nNot downloaded yet."),
@@ -1377,6 +1359,40 @@ fn show_details() {
             set_text(ui.ctl[&ID_VIEW], &text);
         }
     });
+}
+
+/// e.g. "Source mp3 55 kbps stereo (identical channels) -> Opus 32 kbps mono (Auto)".
+fn source_line(e: &store::Episode, s: &Settings) -> String {
+    let r = &e.record;
+    let mut src = r.codec.clone();
+    if let Some(k) = r.source_kbps {
+        src.push_str(&format!(" {k} kbps"));
+    }
+    src.push_str(&match (r.channels, r.identical) {
+        (0, _) => String::new(),
+        (1, _) => " mono".into(),
+        (2, Some(true)) => " stereo (identical channels)".into(),
+        (2, Some(false)) => " stereo".into(),
+        (2, None) => " stereo (not checked)".into(),
+        (n, _) => format!(" {n} channels"),
+    });
+    let done = r.opus_kbps > 0 && matches!(e.state, State::Ready | State::Delivered);
+    let (kbps, mono, how) = if done {
+        (r.opus_kbps, r.out_mono, String::new())
+    } else {
+        let t = pipeline::target(s, e);
+        let how = match (t.auto_kbps, t.auto_channels) {
+            (true, true) => " (Auto)",
+            (true, false) => " (Auto bitrate)",
+            (false, true) => " (Auto channels)",
+            (false, false) => " (set in Options)",
+        };
+        (t.kbps, t.mono, how.to_string())
+    };
+    format!(
+        "Source {src} \u{2192} Opus {kbps} kbps {}{how}",
+        if mono { "mono" } else { "stereo" }
+    )
 }
 
 fn update_buttons() {
@@ -1409,9 +1425,15 @@ fn update_buttons() {
         en(B_COPYFEED, show.is_some());
         en(B_CANCEL, ui.busy);
         SetWindowLongPtrW(ui.ctl[&B_TOKEN], GWLP_USERDATA, ui.token_on as isize);
-        SetWindowLongPtrW(ui.ctl[&B_MONO], GWLP_USERDATA, ui.mono_on as isize);
+        let ch = wide(match ui.channels {
+            store::Channels::Auto => {
+                "Auto (mono when the source is mono or both channels are the same)"
+            }
+            c => c.label(),
+        });
+        let _ = SetWindowTextW(ui.ctl[&B_CHANNELS], PCWSTR(ch.as_ptr()));
         let _ = InvalidateRect(ui.ctl[&B_TOKEN], None, false);
-        let _ = InvalidateRect(ui.ctl[&B_MONO], None, false);
+        let _ = InvalidateRect(ui.ctl[&B_CHANNELS], None, false);
         let model = if ui.models.is_empty() {
             "No ggml-*.bin model next to Podcast Trim.exe".to_string()
         } else {
@@ -1632,8 +1654,8 @@ fn on_command(id: i32, code: u32) {
                             &paths.cleaned(show.unwrap(), &ep),
                             &cuts,
                             ep.record.duration,
-                            pipeline::target_kbps(&settings, &ep).0,
-                            settings.mono,
+                            pipeline::target(&settings, &ep).kbps,
+                            pipeline::target(&settings, &ep).mono,
                         );
                         let mut t = format!(
                             "{} cut(s), {} removed:\n",
@@ -1752,9 +1774,15 @@ fn on_command(id: i32, code: u32) {
         B_CLOSE => unsafe {
             let _ = DestroyWindow(hwnd);
         },
-        B_MONO => {
-            with(|ui| ui.mono_on = !ui.mono_on);
-            update_buttons();
+        B_CHANNELS => {
+            let info = with(|ui| (ui.channels, ui.ctl[&B_CHANNELS]));
+            if let Some((cur, btn)) = info {
+                let items = store::Channels::ALL
+                    .iter()
+                    .map(|c| c.label().to_string())
+                    .collect();
+                unsafe { open_dropdown(btn, B_CHANNELS, items, cur.label()) };
+            }
         }
         B_MODEL => {
             let info = with(|ui| {
@@ -1763,7 +1791,7 @@ fn on_command(id: i32, code: u32) {
             });
             if let Some((models, cur, btn)) = info {
                 if !models.is_empty() {
-                    unsafe { open_dropdown(btn, models, &cur) };
+                    unsafe { open_dropdown(btn, B_MODEL, models, &cur) };
                 }
             }
             update_buttons();
@@ -1781,7 +1809,7 @@ fn on_command(id: i32, code: u32) {
                 let old_bind = (sh.settings.bind.clone(), sh.settings.port);
                 let s = &mut sh.settings;
                 s.whisper_model = ui.model.clone();
-                s.mono = ui.mono_on;
+                s.channels = ui.channels;
                 s.threads = v[0].parse().unwrap_or(s.threads);
                 s.language = v[1].clone();
                 s.bind = v[2].clone();
@@ -1935,7 +1963,7 @@ unsafe fn paint(hwnd: HWND) {
             text(dc, s, &mut r, TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         }
         if ui.options {
-            let mut r = sr(ui, 28, 380, cw - 60, 110);
+            let mut r = sr(ui, 28, 404, cw - 60, 110);
             let note = format!(
                 "Note: ffmpeg.exe, ffprobe.exe, whisper-cli.exe with its DLLs, and ggml-*.bin models must be in the same folder as Podcast Trim.exe.\nThe feed server is listening on {}. Use 0.0.0.0 to reach it from your phone on the same network, or 127.0.0.1 for this PC only. Address and port changes need a restart.\nPC address for phone: leave it blank to use this PC's detected address ({}). Opus bitrate: Auto picks it from each episode's source (as Opus Convert does), or enter a number from 6 to 256.",
                 ui.server_addr,
@@ -1957,11 +1985,14 @@ unsafe fn paint(hwnd: HWND) {
 thread_local! {
     /// Open model list: (items, hovered row, current row).
     static DROP: RefCell<(Vec<String>, i32, i32)> = const { RefCell::new((Vec::new(), -1, -1)) };
+    /// Which field the open list belongs to.
+    static DROP_OWNER: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
 /// Drop-down list under the model field, drawn like the VGUI combo boxes:
 /// a dark-edged field-coloured list with a mustard highlight row.
-unsafe fn open_dropdown(btn: HWND, items: Vec<String>, current: &str) {
+unsafe fn open_dropdown(btn: HWND, owner: i32, items: Vec<String>, current: &str) {
+    DROP_OWNER.with(|o| o.set(owner));
     let d = DPI.load(std::sync::atomic::Ordering::Relaxed);
     let mut r = RECT::default();
     let _ = GetWindowRect(btn, &mut r);
@@ -2068,7 +2099,8 @@ unsafe extern "system" fn drop_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             let pick = if inside { (y - 1) / row } else { -1 };
             if (0..n).contains(&pick) {
                 let main = HWND(MAIN.load(std::sync::atomic::Ordering::Relaxed) as _);
-                let _ = PostMessageW(main, WM_MODEL_PICK, WPARAM(pick as usize), LPARAM(0));
+                let owner = DROP_OWNER.with(|o| o.get()) as isize;
+                let _ = PostMessageW(main, WM_MODEL_PICK, WPARAM(pick as usize), LPARAM(owner));
             }
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
             let _ = DestroyWindow(hwnd);
@@ -2269,7 +2301,7 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
             tr.left += scale(6, d);
             text(dc, &label, &mut tr, if active { TAN } else { TEXT }, flags);
         }
-        B_TOKEN | B_MONO => {
+        B_TOKEN => {
             let on = GetWindowLongPtrW(dis.hwndItem, GWLP_USERDATA) != 0;
             let s = scale(13, d);
             let bx = RECT {
@@ -2312,7 +2344,7 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
                 flags,
             );
         }
-        B_MODEL => {
+        B_MODEL | B_CHANNELS => {
             // Looks like a VGUI drop-down: sunken field with a small arrow.
             fill(dc, &r, FIELD);
             bevel(dc, &r, false);
@@ -2626,7 +2658,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_MODEL_PICK => {
             with(|ui| {
-                if let Some(m) = ui.models.get(wp.0) {
+                if lp.0 as i32 == B_CHANNELS {
+                    if let Some(c) = store::Channels::ALL.get(wp.0) {
+                        ui.channels = *c;
+                    }
+                } else if let Some(m) = ui.models.get(wp.0) {
                     ui.model = m.clone();
                 }
             });

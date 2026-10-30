@@ -87,6 +87,53 @@ pub fn wav_args(input: &Path, wav: &Path) -> Vec<String> {
     .collect()
 }
 
+/// Quick fake-stereo check: three 10 s samples (at 15%, 50% and 85%) are
+/// joined, then the RMS level of the side (L-R) and mid (L+R) signals is
+/// measured with astats. Fast seeking keeps this to about 30 s of decoding.
+pub fn stereo_check_args(input: &Path, duration: f64) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-hide_banner".into(), "-nostdin".into()];
+    let starts: Vec<f64> = if duration > 40.0 {
+        [0.15, 0.5, 0.85]
+            .iter()
+            .map(|f| duration * f - 5.0)
+            .collect()
+    } else {
+        vec![0.0]
+    };
+    for st in &starts {
+        args.extend([
+            "-ss".into(),
+            num(st.max(0.0)),
+            "-t".into(),
+            "10".into(),
+            "-i".into(),
+            s(input),
+        ]);
+    }
+    let n = starts.len();
+    let ins: String = (0..n).map(|i| format!("[{i}:a]")).collect();
+    let stats = "astats=measure_perchannel=none:measure_overall=RMS_level";
+    args.extend([
+        "-filter_complex".into(),
+        format!(
+            "{ins}concat=n={n}:v=0:a=1,asplit[x][y];\
+             [x]pan=mono|c0=0.5*c0-0.5*c1,{stats}[side];\
+             [y]pan=mono|c0=0.5*c0+0.5*c1,{stats}[mid]"
+        ),
+        "-map".into(),
+        "[side]".into(),
+        "-f".into(),
+        "null".into(),
+        "-".into(),
+        "-map".into(),
+        "[mid]".into(),
+        "-f".into(),
+        "null".into(),
+        "-".into(),
+    ]);
+    args
+}
+
 /// Machine-readable progress on stdout (`out_time_us=...`), no stats on stderr.
 fn progress_args() -> [String; 3] {
     ["-progress".into(), "pipe:1".into(), "-nostats".into()]
@@ -99,7 +146,7 @@ pub fn probe_args(input: &Path) -> Vec<String> {
         "-select_streams".into(),
         "a:0".into(),
         "-show_entries".into(),
-        "stream=codec_name,bit_rate:format=duration,bit_rate".into(),
+        "stream=codec_name,bit_rate,channels:format=duration,bit_rate".into(),
         s(input),
     ]
 }
@@ -203,6 +250,22 @@ mod tests {
             false,
         );
         assert!(a[6].ends_with("[k0]concat=n=1:v=0:a=1[out]"));
+    }
+
+    #[test]
+    fn stereo_check() {
+        let a = stereo_check_args(&PathBuf::from("x.mp3"), 1000.0);
+        assert_eq!(a.iter().filter(|x| *x == "-i").count(), 3);
+        assert!(a.contains(&"145.000".to_string()) && a.contains(&"845.000".to_string()));
+        let g = &a[a.iter().position(|x| x == "-filter_complex").unwrap() + 1];
+        assert!(g.starts_with("[0:a][1:a][2:a]concat=n=3"));
+        assert_eq!(
+            stereo_check_args(&PathBuf::from("x"), 20.0)
+                .iter()
+                .filter(|x| *x == "-i")
+                .count(),
+            1
+        );
     }
 
     #[test]

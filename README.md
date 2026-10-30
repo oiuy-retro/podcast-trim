@@ -42,17 +42,27 @@ Anything else is rejected with the line number of the problem.
 
 ## Audio format
 
-Trimmed episodes are Ogg Opus (`.opus`, encoded with libopus, variable bitrate). With **Opus bitrate** set to Auto (the default) the bitrate is picked from the original with ffprobe, using the same table as Opus Convert:
+Trimmed episodes are Ogg Opus (`.opus`, encoded with libopus, variable bitrate). With **Opus bitrate** and **Channels** set to Auto (the defaults), both are picked from the original with ffprobe.
 
-| Source | Opus bitrate |
+**Channels.** A mono source is encoded mono. For a stereo source, three 10-second samples (at 15%, 50% and 85% of the episode) are checked: if the difference between the channels (L-R) is at least 30 dB quieter than their sum (L+R), the two channels are the same and the episode is encoded mono. Real stereo is usually only 6 to 20 dB quieter; mono saved as stereo is 40 dB or more. Channels can also be set to Mono or Stereo.
+
+**Bitrate.** The stereo bitrate comes from this table. Low-bitrate sources get lower tiers than Opus Convert uses, because Opus is about as good at 48k as MP3 is at 64k, so a trimmed file is never needlessly bigger than its source. From 129k up the tiers are the same as Opus Convert's.
+
+| Source | Stereo Opus bitrate |
 | --- | --- |
-| Opus | its own bitrate, rounded up to 24, 32, 48, 64, 96, 128, 160 or 192k (cutting always re-encodes, so it can't be copied) |
-| Lossless, DTS | 192k |
-| MP3/WMA | ≤128 → 96k, 129–192 → 128k, 193–256 → 160k, 257+ → 192k |
-| AAC/Vorbis | ≤128 → 96k, 129–192 → 128k, 193+ → 160k |
+| MP3/WMA | ≤40 → 32k, 41–64 → 48k, 65–96 → 64k, 97–128 → 96k, 129–192 → 128k, 193–256 → 160k, 257+ → 192k |
+| AAC/Vorbis | ≤40 → 32k, 41–64 → 48k, 65–96 → 64k, 97–128 → 96k, 129–192 → 128k, 193+ → 160k |
 | AC-3 | ≤192 → 128k, 193–384 → 160k, 385+ → 192k |
+| Lossless, DTS | 192k |
+| Opus | its own bitrate, rounded up to 24, 32, 48, 64, 96, 128, 160 or 192k (cutting always re-encodes, so it can't be copied) |
 
-Details shows the source codec and bitrate and the Opus bitrate chosen. A fixed bitrate (6 to 256 kbit/s) and a **Mono** switch are in Options. Feeds list them with the MIME type `audio/ogg`, the registered type for Ogg Opus files (RFC 7845). AntennaPod plays them through its built-in player (ExoPlayer) on Android 5 and later.
+Mono uses about 60% of the stereo bitrate, rounded up, and never less than 24k:
+
+| Stereo | 32k | 48k | 64k | 96k | 128k | 160k | 192k |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Mono | 24k | 32k | 40k | 64k | 80k | 96k | 128k |
+
+Details shows the result, for example `Source mp3 55 kbps stereo (identical channels) → Opus 32 kbps mono (Auto)`. A fixed bitrate (6 to 256 kbit/s) can be entered instead of Auto. Settings from older versions with the **Mono** checkbox ticked become Channels: Mono. Feeds list them with the MIME type `audio/ogg`, the registered type for Ogg Opus files (RFC 7845). AntennaPod plays them through its built-in player (ExoPlayer) on Android 5 and later.
 
 ## Run
 

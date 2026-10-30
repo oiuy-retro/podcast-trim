@@ -28,9 +28,42 @@ pub struct Settings {
     pub require_token: bool,
     /// Opus bitrate in kbit/s; 0 = Auto (picked from the source, see bitrate.rs).
     pub bitrate_k: u32,
-    /// Downmix trimmed episodes to mono.
+    /// Output channels: Auto (from the source), Mono or Stereo.
+    pub channels: Channels,
+    /// Old "Mono" checkbox, read once and turned into `channels`.
+    #[serde(skip_serializing)]
     pub mono: bool,
     pub export_dir: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Channels {
+    #[default]
+    Auto,
+    Mono,
+    Stereo,
+}
+
+impl Channels {
+    pub const ALL: [Channels; 3] = [Channels::Auto, Channels::Mono, Channels::Stereo];
+    pub fn label(self) -> &'static str {
+        match self {
+            Channels::Auto => "Auto",
+            Channels::Mono => "Mono",
+            Channels::Stereo => "Stereo",
+        }
+    }
+}
+
+impl Settings {
+    /// Upgrade settings written by older versions.
+    pub fn migrate(mut self) -> Self {
+        if self.mono {
+            self.channels = Channels::Mono;
+            self.mono = false;
+        }
+        self
+    }
 }
 
 impl Default for Settings {
@@ -49,6 +82,7 @@ impl Default for Settings {
             public_host: String::new(),
             require_token: true,
             bitrate_k: 0,
+            channels: Channels::Auto,
             mono: false,
             export_dir: String::new(),
         }
@@ -83,6 +117,15 @@ pub struct Record {
     pub source_kbps: Option<u32>,
     #[serde(default)]
     pub opus_kbps: u32,
+    /// Source channel count, and whether a stereo source's two channels
+    /// were found to be the same (None = not checked).
+    #[serde(default)]
+    pub channels: u32,
+    #[serde(default)]
+    pub identical: Option<bool>,
+    /// The cut file was encoded as mono.
+    #[serde(default)]
+    pub out_mono: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -305,6 +348,10 @@ mod tests {
         let back: Library = load_json(&p);
         assert_eq!(back.show(2).unwrap().title, "B");
         let s: Settings = serde_json::from_str("{\"port\":1}").unwrap();
-        assert_eq!((s.port, s.bitrate_k, s.mono), (1, 0, false));
+        assert_eq!((s.port, s.bitrate_k, s.channels), (1, 0, Channels::Auto));
+        let old: Settings = serde_json::from_str(r#"{"mono": true}"#).unwrap();
+        assert_eq!(old.migrate().channels, Channels::Mono);
+        let text = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(text.contains("\"channels\":\"Auto\"") && !text.contains("\"mono\""));
     }
 }

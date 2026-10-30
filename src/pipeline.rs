@@ -6,7 +6,7 @@ use crate::cutlist::{self, Cut};
 use crate::ffargs;
 use crate::progress;
 use crate::rss;
-use crate::store::{sha256_file, Episode, Paths, Settings, Show, State};
+use crate::store::{sha256_file, Channels, Episode, Paths, Settings, Show, State};
 use crate::transcript;
 use std::fs;
 use std::path::Path;
@@ -81,24 +81,66 @@ pub fn merge_feed(show: &mut Show, feed: &rss::SourceFeed) -> usize {
 /// Read duration, codec and bitrate of the original into the record.
 fn probe(env: &dyn Env, s: &Settings, file: &Path, ep: &mut Episode) -> Result<(), String> {
     let out = env.run(&s.ffprobe, &ffargs::probe_args(file))?;
-    let (codec, kbps, dur) = bitrate::parse_probe(&out);
-    ep.record.duration =
-        dur.ok_or_else(|| format!("ffprobe gave no duration: `{}`", out.trim()))?;
-    ep.record.codec = codec;
-    ep.record.source_kbps = kbps;
+    let p = bitrate::parse_probe(&out);
+    ep.record.duration = p
+        .duration
+        .ok_or_else(|| format!("ffprobe gave no duration: `{}`", out.trim()))?;
+    ep.record.codec = p.codec;
+    ep.record.source_kbps = p.kbps;
+    ep.record.channels = p.channels;
+    ep.record.identical = if p.channels == 2 {
+        same_channels(env, s, file, ep.record.duration)
+    } else {
+        None
+    };
     Ok(())
 }
 
-/// Opus bitrate for this episode: the Options value, or picked from the
-/// source when Options says Auto (0). Returns (kbps, auto).
-pub fn target_kbps(s: &Settings, ep: &Episode) -> (u32, bool) {
-    if s.bitrate_k == 0 {
-        (
-            bitrate::cut_kbps(&ep.record.codec, ep.record.source_kbps),
-            true,
-        )
+/// Are the left and right channels the same? `None` if the check failed.
+fn same_channels(env: &dyn Env, s: &Settings, file: &Path, duration: f64) -> Option<bool> {
+    let mut log = String::new();
+    env.progress("Checking channels", 0.0);
+    env.run_watch(
+        &s.ffmpeg,
+        &ffargs::stereo_check_args(file, duration),
+        &mut |l| {
+            if l.contains("Parsed_astats_") {
+                log.push_str(l);
+                log.push('\n');
+            }
+        },
+    )
+    .ok()?;
+    let (side, mid) = bitrate::parse_side_mid(&log)?;
+    Some(bitrate::identical_channels(side, mid))
+}
+
+/// Channels and bitrate for this episode's cut file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Target {
+    pub kbps: u32,
+    pub mono: bool,
+    pub auto_kbps: bool,
+    pub auto_channels: bool,
+}
+
+pub fn target(s: &Settings, ep: &Episode) -> Target {
+    let r = &ep.record;
+    let mono = match s.channels {
+        Channels::Mono => true,
+        Channels::Stereo => false,
+        Channels::Auto => r.channels == 1 || r.identical == Some(true),
+    };
+    let kbps = if s.bitrate_k == 0 {
+        bitrate::cut_kbps(&r.codec, r.source_kbps, mono)
     } else {
-        (s.bitrate_k, false)
+        s.bitrate_k
+    };
+    Target {
+        kbps,
+        mono,
+        auto_kbps: s.bitrate_k == 0,
+        auto_channels: s.channels == Channels::Auto,
     }
 }
 
@@ -187,8 +229,8 @@ pub fn apply_cuts(
 ) -> Result<(), String> {
     let orig = paths.original(show, ep);
     let out = paths.cleaned(show, ep);
-    let (kbps, _) = target_kbps(s, ep);
-    let args = ffargs::cut_args(&orig, &out, &cuts, ep.record.duration, kbps, s.mono);
+    let t = target(s, ep);
+    let args = ffargs::cut_args(&orig, &out, &cuts, ep.record.duration, t.kbps, t.mono);
     let kept = ep.record.duration - cuts.iter().map(|c| c.end - c.start).sum::<f64>();
     if let Err(e) = ffmpeg_watch(env, &s.ffmpeg, &args, "Cutting", kept, (0.0, 1.0)) {
         let _ = fs::remove_file(&out);
@@ -199,7 +241,8 @@ pub fn apply_cuts(
         .len();
     ep.record.cuts = cuts;
     ep.record.ffmpeg_args = args;
-    ep.record.opus_kbps = kbps;
+    ep.record.opus_kbps = t.kbps;
+    ep.record.out_mono = t.mono;
     ep.state = State::Ready;
     let _ = fs::remove_file(&orig);
     Ok(())
@@ -284,6 +327,9 @@ mod tests {
         body: RefCell<Vec<u8>>,
         calls: RefCell<Vec<(String, Vec<String>)>>,
         seen: RefCell<Vec<(String, f64)>>,
+        /// ffprobe output, and the side level the fake stereo check reports.
+        probe: RefCell<String>,
+        side_db: RefCell<String>,
     }
 
     impl Env for Fake {
@@ -295,7 +341,8 @@ mod tests {
                 .borrow_mut()
                 .push((program.into(), args.to_vec()));
             match program {
-                "ffprobe" => Ok("100.0\n".into()),
+                "ffprobe" => Ok(self.probe.borrow().clone()),
+                "ffmpeg" if args.last().unwrap() == "-" => Ok(String::new()),
                 "ffmpeg" => {
                     fs::write(args.last().unwrap(), b"cleaned").unwrap();
                     Ok(String::new())
@@ -315,6 +362,14 @@ mod tests {
             line: &mut dyn FnMut(&str),
         ) -> Result<String, String> {
             let out = self.run(program, args)?;
+            if args.last().unwrap() == "-" {
+                line(&format!(
+                    "[Parsed_astats_3 @ 0x1] RMS level dB: {}",
+                    self.side_db.borrow()
+                ));
+                line("[Parsed_astats_5 @ 0x2] RMS level dB: -20.0");
+                return Ok(out);
+            }
             for l in [
                 "out_time_us=40000000",
                 "whisper: progress =  50%",
@@ -353,6 +408,8 @@ mod tests {
                 body: RefCell::new(b"original".to_vec()),
                 calls: RefCell::new(vec![]),
                 seen: RefCell::new(vec![]),
+                probe: RefCell::new("100.0\n".into()),
+                side_db: RefCell::new("-inf".into()),
             },
             s,
             Paths::new(root),
@@ -430,6 +487,36 @@ mod tests {
             .iter()
             .any(|(st, f)| st == "Cutting" && (*f - 0.5).abs() < 1e-9));
         assert_eq!(env.seen.borrow().last().unwrap().1, 1.0);
+    }
+
+    #[test]
+    fn auto_channels_and_bitrate() {
+        let (env, mut s, paths, mut ep) = setup("channels");
+        *env.probe.borrow_mut() = "[STREAM]\ncodec_name=mp3\nchannels=2\nbit_rate=55000\n[/STREAM]\n[FORMAT]\nduration=100.0\n[/FORMAT]\n".into();
+        // Identical channels: mono, mono tier.
+        download(&env, &s, &paths, 1, &mut ep).unwrap();
+        assert_eq!(ep.record.identical, Some(true));
+        let t = target(&s, &ep);
+        assert_eq!((t.kbps, t.mono), (32, true));
+        // Real stereo.
+        *env.side_db.borrow_mut() = "-31.0".into();
+        download(&env, &s, &paths, 1, &mut ep).unwrap();
+        assert_eq!(ep.record.identical, Some(false));
+        assert_eq!((target(&s, &ep).kbps, target(&s, &ep).mono), (48, false));
+        // Overrides.
+        s.channels = Channels::Mono;
+        assert_eq!((target(&s, &ep).kbps, target(&s, &ep).mono), (32, true));
+        s.bitrate_k = 64;
+        s.channels = Channels::Stereo;
+        let t = target(&s, &ep);
+        assert_eq!(
+            (t.kbps, t.mono, t.auto_kbps, t.auto_channels),
+            (64, false, false, false)
+        );
+        transcribe(&env, &s, &paths, 1, &mut ep).unwrap();
+        apply_cuts(&env, &s, &paths, 1, &mut ep, vec![]).unwrap();
+        assert_eq!((ep.record.opus_kbps, ep.record.out_mono), (64, false));
+        assert!(!ep.record.ffmpeg_args.contains(&"-ac".to_string()));
     }
 
     #[test]
