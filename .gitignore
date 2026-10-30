@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+*.pdb
+*.exe
+*.dll
+dist/
+*.log
+.idea/
+.vscode/
+# Local data, secrets, and media
+settings.json
+library.json
+*.token
+*.mp3
+*.m4a
+*.wav
+*.bin
