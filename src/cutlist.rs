@@ -7,6 +7,8 @@
 //!   start/end may be strings in the same time format or numbers of seconds.
 //!
 //! Blank lines, lines starting with `#`, and Markdown code fences are ignored.
+//! Prose before the list is skipped and the list ends at the first non-range
+//! line after it, so notes an AI adds around the ranges are ignored.
 
 use serde::{Deserialize, Serialize};
 
@@ -102,23 +104,43 @@ pub fn parse_reply(reply: &str) -> Result<Vec<Cut>, String> {
             })
             .collect();
     }
+    // Plain lines. Chatter before the list is skipped; once ranges begin,
+    // blank lines, `#` comments and fences are allowed, and the first other
+    // line ends the list (anything after it is ignored). A line that looks
+    // like a range but does not parse is still an error.
     let mut cuts = Vec::new();
-    for (n, raw) in trimmed.lines().enumerate() {
+    let mut none = false;
+    for (n, raw) in reply.lines().enumerate() {
         let line = raw.trim().trim_start_matches(['-', '*', ' ']).trim();
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() || line.starts_with('#') || line.starts_with("```") {
             continue;
         }
         if line.eq_ignore_ascii_case("none") {
+            none = true;
             continue;
         }
         let line = line.replace(['\u{2013}', '\u{2014}'], "-");
+        let looks_like_range = line.starts_with(|c: char| c.is_ascii_digit())
+            && (line.contains('-') || line.contains("-->"));
+        if !looks_like_range {
+            if cuts.is_empty() {
+                continue;
+            }
+            break;
+        }
         let (a, b) = line
             .split_once("-->")
             .or_else(|| line.split_once('-'))
             .ok_or_else(|| format!("line {}: expected START-END, got `{}`", n + 1, raw.trim()))?;
         let start = parse_time(a).map_err(|e| format!("line {}: {e}", n + 1))?;
         let end = parse_time(b).map_err(|e| format!("line {}: {e}", n + 1))?;
+        if end <= start {
+            return Err(format!("line {}: end must be after start", n + 1));
+        }
         cuts.push(Cut { start, end });
+    }
+    if cuts.is_empty() && !none {
+        return Err("no ad ranges found (reply NONE if there are no ads)".into());
     }
     Ok(cuts)
 }
@@ -240,6 +262,18 @@ mod tests {
     fn rejects_commands() {
         assert!(parse_reply("ffmpeg -i in.mp3 -af atrim out.mp3").is_err());
         assert!(parse_reply("00:00:01-00:00:02; del C:\\x").is_err());
+    }
+
+    #[test]
+    fn tolerates_chatter() {
+        let r = "Here are the ads:\n```\n00:00:00.000-00:00:20.360\n\n00:11:17.080-00:12:07.520\n```\n00:50:02.360-00:50:32.040\n\nNotes:\n- 00:11:17 is two spots merged.\n- 1-2 seconds of leftover ad.\n";
+        let c = parse_reply(r).unwrap();
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[2].end, 3032.04);
+        assert!(parse_reply("Ads:\n00:00:01-00:00:02\n00:99:00-00:99:10").is_err());
+        assert!(parse_reply("00:00:05-00:00:02").unwrap_err().starts_with("line 1"));
+        assert!(parse_reply("I could not find anything.").is_err());
+        assert!(parse_reply("Sure.\nNONE").unwrap().is_empty());
     }
 
     #[test]

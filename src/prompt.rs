@@ -8,7 +8,10 @@ The episode is {duration} long. Each line starts with [START-END] timestamps \
 in HH:MM:SS.mmm format.
 
 Find every advertisement, sponsor read, promo for another show, and \
-listener-support or subscription appeal. Do not mark the show's own content, \
+listener-support or subscription appeal. Every paid sponsor read or inserted \
+ad counts, whatever the product (retail, fragrance, apps, banks, and so on). \
+An ad break often holds several ads back to back, so keep going until the \
+show itself resumes. Do not mark the show's own content, \
 intro music, or outro as an ad unless it contains an ad. Start each range \
 at the first line of the ad and end it at the last line of the ad, using the \
 timestamps from the transcript.
@@ -20,8 +23,8 @@ Example reply:
 00:00:00.000-00:00:42.500
 00:23:10.120-00:25:01.900
 
-If there are no ads, reply with the single word NONE. Do not write commands, \
-explanations, or code.
+If there are no ads, reply with the single word NONE. Do not write notes, \
+commands, explanations, or code.
 
 Transcript:
 {transcript}";
@@ -42,5 +45,7 @@ mod tests {
         assert!(p.contains("\"T\" from the show \"S\""));
         assert!(p.ends_with("hi\n"));
         assert!(!p.contains('{'));
+        assert!(p.contains("several ads back to back"));
+        assert!(p.contains("Do not write notes"));
     }
 }
