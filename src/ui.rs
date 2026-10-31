@@ -8,7 +8,8 @@ use podcast_trim::cutlist::{format_time, removed_seconds, Cut};
 use podcast_trim::pipeline::{self, Env};
 use podcast_trim::server::{self, Shared, SharedRef};
 use podcast_trim::store::{self, load_json, save_json, Library, Paths, Settings, State};
-use podcast_trim::{ffargs, prompt, rss};
+use podcast_trim::config::Conf;
+use podcast_trim::{ffargs, prompt, rss, tools};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
@@ -438,8 +439,14 @@ pub fn run() -> i32 {
     let token_on = settings.require_token;
     let channels = settings.channels;
     let model = settings.whisper_model.clone();
+    let mut conf = Conf::load(&tools::exe_dir(), &paths.root);
+    if conf.folder("export").is_empty() && !settings.export_dir.trim().is_empty() {
+        let _ = conf.set_folder("export", settings.export_dir.trim());
+    }
+    let models = tools::model_names(&conf, &tools::exe_dir());
     let shared: SharedRef = Arc::new(Mutex::new(Shared {
         lib,
+        conf,
         settings,
         paths,
         coverage: HashMap::new(),
@@ -538,7 +545,7 @@ pub fn run() -> i32 {
             options: false,
             token_on,
             channels,
-            models: podcast_trim::tools::models(&podcast_trim::tools::exe_dir()),
+            models,
             model,
             server_addr: String::new(),
             frames: vec![],
@@ -577,17 +584,17 @@ pub fn run() -> i32 {
         with(|ui| match started {
             Ok(addr) => {
                 ui.server_addr = addr.to_string();
-                let dir = podcast_trim::tools::exe_dir();
-                let miss = podcast_trim::tools::missing(&dir);
+                let conf = ui.shared.lock().unwrap().conf.clone();
+                let miss = tools::missing(&conf, &tools::exe_dir());
                 if miss.is_empty() {
                     status(ui, &format!("Feed server listening on {addr}."));
                 } else {
-                    ui.missing = podcast_trim::tools::missing_message(&dir, &miss);
+                    ui.missing = tools::missing_message(&conf, &miss);
                     status(
                         ui,
                         &format!(
-                            "{} missing next to Podcast Trim.exe. The list is in Details.",
-                            store::plural(miss.len(), "file")
+                            "Can't find {}. The list is in Details.",
+                            store::plural(miss.len(), "helper file")
                         ),
                     );
                 }
@@ -1086,7 +1093,10 @@ fn build_controls(instance: HINSTANCE) {
         // Options page
         let o = PAGE_OPT;
         ui.anchor = FIXED;
-        let s = ui.shared.lock().unwrap().settings.clone();
+        let (s, export_dir) = {
+            let sh = ui.shared.lock().unwrap();
+            (sh.settings.clone(), sh.conf.folder("export"))
+        };
         label(ui, "Whisper model", o, 28, 76, 180);
         child(
             ui,
@@ -1110,7 +1120,7 @@ fn build_controls(instance: HINSTANCE) {
             } else {
                 s.bitrate_k.to_string()
             },
-            s.export_dir,
+            export_dir,
         ];
         for (i, v) in vals.iter().enumerate() {
             let y = 72 + (i as i32 + 1) * 32;
@@ -1493,7 +1503,7 @@ fn episode_job(
     work: impl FnOnce(&Settings, &Paths, &mut store::Episode) -> Result<String, String> + Send + 'static,
 ) -> impl FnOnce(&SharedRef) -> Result<String, String> + Send + 'static {
     move |shared| {
-        let (settings, root, mut ep) = {
+        let (settings, conf, root, mut ep) = {
             let sh = shared.lock().unwrap();
             let ep = sh
                 .lib
@@ -1501,9 +1511,9 @@ fn episode_job(
                 .and_then(|s| s.episodes.iter().find(|e| e.guid == guid))
                 .cloned()
                 .ok_or("episode is gone")?;
-            (sh.settings.clone(), sh.paths.root.clone(), ep)
+            (sh.settings.clone(), sh.conf.clone(), sh.paths.root.clone(), ep)
         };
-        let settings = podcast_trim::tools::resolve(&settings, &podcast_trim::tools::exe_dir())?;
+        let settings = tools::resolve(&settings, &conf, &tools::exe_dir())?;
         let paths = Paths::new(root);
         let res = work(&settings, &paths, &mut ep);
         let mut sh = shared.lock().unwrap();
@@ -1722,19 +1732,18 @@ fn on_command(id: i32, code: u32) {
             };
             // Folder picker first (modal, re-enters the window procedure),
             // starting in the last folder used.
-            let last = with(|ui| ui.shared.lock().unwrap().settings.export_dir.clone())
+            let last = with(|ui| ui.shared.lock().unwrap().conf.folder("export"))
                 .unwrap_or_default();
             let Some(picked) = (unsafe { pick_folder(hwnd, &last) }) else {
                 return;
             };
             with(|ui| {
                 let mut sh = ui.shared.lock().unwrap();
-                sh.settings.export_dir = picked.clone();
-                let _ = save_json(&sh.paths.settings(), &sh.settings);
+                let _ = sh.conf.set_folder("export", &picked);
                 if let Some(h) = ui.ctl.get(&(OPT_BASE + 6)) {
                     set_text(*h, &picked);
                 }
-                let dir = sh.settings.export_dir.clone();
+                let dir = picked.clone();
                 let ep = sh
                     .lib
                     .show(show)
@@ -1786,7 +1795,8 @@ fn on_command(id: i32, code: u32) {
         }
         B_MODEL => {
             let info = with(|ui| {
-                ui.models = podcast_trim::tools::models(&podcast_trim::tools::exe_dir());
+                let conf = ui.shared.lock().unwrap().conf.clone();
+                ui.models = tools::model_names(&conf, &tools::exe_dir());
                 (ui.models.clone(), ui.model.clone(), ui.ctl[&B_MODEL])
             });
             if let Some((models, cur, btn)) = info {
@@ -1824,10 +1834,11 @@ fn on_command(id: i32, code: u32) {
                         .filter(|b| *b == 0 || (6..=256).contains(b))
                         .unwrap_or(s.bitrate_k)
                 };
-                s.export_dir = v[6].clone();
+                s.export_dir = String::new();
                 s.require_token = ui.token_on;
                 let restart = old_bind != (s.bind.clone(), s.port);
-                let r = save_json(&sh.paths.settings(), &sh.settings);
+                let r = save_json(&sh.paths.settings(), &sh.settings)
+                    .and_then(|_| sh.conf.set_folder("export", &v[6]));
                 drop(sh);
                 status(
                     ui,
@@ -1965,7 +1976,7 @@ unsafe fn paint(hwnd: HWND) {
         if ui.options {
             let mut r = sr(ui, 28, 404, cw - 60, 110);
             let note = format!(
-                "Note: ffmpeg.exe, ffprobe.exe, whisper-cli.exe with its DLLs, and ggml-*.bin models must be in the same folder as Podcast Trim.exe.\nThe feed server is listening on {}. Use 0.0.0.0 to reach it from your phone on the same network, or 127.0.0.1 for this PC only. Address and port changes need a restart.\nPC address for phone: leave it blank to use this PC's detected address ({}). Opus bitrate: Auto picks it from each episode's source (as Opus Convert does), or enter a number from 6 to 256.",
+                "Note: ffmpeg.exe, ffprobe.exe, whisper-cli.exe (with its DLLs beside it) and ggml-*.bin models are found next to Podcast Trim.exe, in a folder inside it, or on PATH. configuration.conf next to the exe can point to them anywhere else.\nThe feed server is listening on {}. Use 0.0.0.0 to reach it from your phone on the same network, or 127.0.0.1 for this PC only. Address and port changes need a restart.\nPC address for phone: leave it blank to use this PC's detected address ({}). Opus bitrate: Auto picks it from each episode's source (as Opus Convert does), or enter a number from 6 to 256.",
                 ui.server_addr,
                 ui.lan.map(|i| i.to_string()).unwrap_or_else(|| "none found".into())
             );
@@ -2137,8 +2148,10 @@ unsafe fn pick_folder(owner: HWND, start: &str) -> Option<String> {
     dlg.SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)
         .ok()?;
     let _ = dlg.SetTitle(w!("Export Opus to folder"));
-    if !start.trim().is_empty() && Path::new(start.trim()).is_dir() {
-        let ws = wide(start.trim());
+    // A remembered folder that's gone (unplugged drive) opens at its nearest
+    // parent that still exists.
+    if let Some(dir) = podcast_trim::config::nearest_existing(start) {
+        let ws = wide(&dir.to_string_lossy());
         if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(ws.as_ptr()), None)
         {
             let _ = dlg.SetFolder(&item);

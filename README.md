@@ -13,7 +13,7 @@ Windows app that cuts ads out of podcast episodes using a local Whisper transcri
 7. Once a client has downloaded every byte of a trimmed file, the file is deleted and the episode is marked SENT. The app keeps the hash, the transcript, the cut list, and the ffmpeg arguments.
 8. **Regenerate** on a SENT episode downloads the original again, checks that its hash matches, and rebuilds the trimmed file from the saved cuts without transcribing again or asking the AI again. If the publisher has changed the file (for example, new ads were inserted), the hash will not match, the old cuts are discarded, and the episode goes back to the transcribe step.
 
-**Export Opus...** asks for a folder (it starts in the last one used) and copies the trimmed episode there, for use without the feed.
+**Export Opus...** asks for a folder (it starts in the last one used, saved in `configuration.conf`) and copies the trimmed episode there, for use without the feed.
 
 ## AI reply format
 
@@ -66,21 +66,54 @@ Details shows the result, for example `Source mp3 55 kbps stereo (identical chan
 
 ## Run
 
-Everything Podcast Trim needs must be in the same folder as `Podcast Trim.exe`:
+Podcast Trim needs these programs. It finds them the way `configuration.conf` says (below), so they can sit next to `Podcast Trim.exe`, in a folder inside it, on PATH, or anywhere else you point to.
 
 | File | From |
 | --- | --- |
-| `ffmpeg.exe`, `ffprobe.exe` | FFmpeg, the `bin` folder of a [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) build |
-| `whisper-cli.exe`, `whisper.dll`, `ggml.dll`, `ggml-base.dll`, `ggml-cpu-*.dll` | the `Release` folder of `whisper-bin-x64.zip` from the [whisper.cpp releases](https://github.com/ggml-org/whisper.cpp/releases) (copying the whole folder is fine) |
+| `ffmpeg.exe`, `ffprobe.exe` | FFmpeg, for example a [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) build. Its unzipped folder can be dropped in as is, since `auto` also looks in `bin`. |
+| `whisper-cli.exe`, `whisper.dll`, `ggml.dll`, `ggml-base.dll`, `ggml-cpu-*.dll` | the `Release` folder of `whisper-bin-x64.zip` from the [whisper.cpp releases](https://github.com/ggml-org/whisper.cpp/releases). The DLLs must stay in the same folder as `whisper-cli.exe`. |
 | one or more `ggml-*.bin` models | [whisper.cpp models](https://huggingface.co/ggerganov/whisper.cpp/tree/main), for example `ggml-base.en.bin` |
 
-1. Put `Podcast Trim.exe` and the files above in one folder.
-2. Start `Podcast Trim.exe`. If anything is missing, the status line lists what is missing and where it goes, and transcribing and cutting stay unavailable until it is there.
-3. If there is more than one model in the folder, press **Options**, open the **Whisper model** list and pick one, and press **Save**. Larger models are more accurate and slower on the CPU. `base.en` or `small.en` is a reasonable start for English shows.
+For example:
+
+```
+Podcast Trim.exe
+configuration.conf
+ffmpeg-9.0.2-essentials_build\bin\ffmpeg.exe, ffprobe.exe
+whisper\whisper-cli.exe and its DLLs
+models\ggml-base.en.bin
+```
+
+1. Put `Podcast Trim.exe` in a folder and the programs above next to it or in folders inside it.
+2. Start `Podcast Trim.exe`. If anything can't be found, the status line says so and Details lists each missing file with the `configuration.conf` line it came from. Transcribing and cutting stay unavailable until it is fixed.
+3. If more than one model is found, press **Options**, open the **Whisper model** list and pick one, and press **Save**. Larger models are more accurate and slower on the CPU. `base.en` or `small.en` is a reasonable start for English shows.
+
+### configuration.conf
+
+On first start Podcast Trim writes `configuration.conf` next to `Podcast Trim.exe`, with comments explaining each line. Edit it with any text editor while the app is closed. The layout is the same in all oiuy-retro Windows apps.
+
+```
+[tools]
+ffmpeg = auto
+ffprobe = path
+whisper-cli = D:\Apps\whisper\whisper-cli.exe
+whisper-model = auto
+
+[folders]
+export = E:\Podcasts
+```
+
+- `auto` looks next to `Podcast Trim.exe`, then in each folder directly inside it, then in a `bin` folder inside each of those, then on PATH. A missing line means `auto`.
+- `path` looks only on PATH.
+- Anything else is a file, or a folder holding it. Relative paths start from the folder `Podcast Trim.exe` is in, and `%VARIABLES%` such as `%USERPROFILE%` are expanded. If the file isn't there, the app says which line to fix instead of looking elsewhere.
+- `whisper-model = auto` lists every `ggml-*.bin` found the `auto` way in Options. A file path uses that model only.
+- `[folders]` holds the folder each folder picker last used. The app rewrites only that line, so your comments and other edits stay. A remembered folder that no longer exists (for example an unplugged drive) opens at its nearest parent that still exists.
+- If the folder `Podcast Trim.exe` is in can't be written to (for example under Program Files), the file is read from there and changes are saved to `%AppData%\Podcast Trim\configuration.conf` instead.
+- Unknown lines and sections are ignored.
 
 Settings, the show list, and episode records are stored in `%AppData%\Podcast Trim`. Set the `PODCAST_TRIM_DATA` environment variable to use another folder.
 
-Tested with FFmpeg `9.0.2-essentials_build` (Gyan) and whisper.cpp `b5454` (`whisper-bin-x64.zip`) with the `ggml-tiny.en.bin` model, under Wine.
+Tested with FFmpeg `9.0.2-essentials_build` (Gyan) and whisper.cpp `b5454` (`whisper-bin-x64.zip`) with the `ggml-tiny.en.bin` model, under Wine, both with everything next to the exe and with the folder layout shown above.
 
 ## Build
 
@@ -105,7 +138,7 @@ cargo test --target x86_64-unknown-linux-gnu --lib
 cargo clippy --all-targets
 ```
 
-`tests/e2e.rs` runs the whole download, transcribe, cut, deliver, and regenerate cycle with the real tools when `PT_TOOLS_DIR` (a folder with the same files as the app folder) and `PT_SAMPLE` (a short audio file, such as whisper.cpp's `samples/jfk.mp3`) are set. Otherwise it is skipped.
+`tests/e2e.rs` runs the whole download, transcribe, cut, deliver, and regenerate cycle with the real tools when `PT_TOOLS_DIR` (a folder laid out like the app folder, found the `auto` way) and `PT_SAMPLE` (a short audio file, such as whisper.cpp's `samples/jfk.mp3`) are set. Otherwise it is skipped.
 
 ## Look
 

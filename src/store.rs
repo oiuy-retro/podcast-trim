@@ -10,14 +10,14 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Tool paths are filled in at run time from the exe folder (see tools.rs).
+    /// Tool paths are filled in at run time from configuration.conf (see tools.rs).
     #[serde(skip)]
     pub ffmpeg: String,
     #[serde(skip)]
     pub ffprobe: String,
     #[serde(skip)]
     pub whisper_cli: String,
-    /// File name of the chosen ggml model in the exe folder.
+    /// The chosen ggml model, as named in Options (relative to the exe folder).
     pub whisper_model: String,
     pub threads: u32,
     pub language: String,
@@ -33,6 +33,8 @@ pub struct Settings {
     /// Old "Mono" checkbox, read once and turned into `channels`.
     #[serde(skip_serializing)]
     pub mono: bool,
+    /// Old export folder, read once and moved to configuration.conf [folders].
+    #[serde(skip_serializing)]
     pub export_dir: String,
 }
 

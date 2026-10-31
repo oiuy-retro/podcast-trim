@@ -18,6 +18,8 @@ use std::time::Duration;
 
 pub struct Shared {
     pub lib: Library,
+    /// configuration.conf: tool locations and remembered folders.
+    pub conf: crate::config::Conf,
     pub settings: Settings,
     pub paths: Paths,
     pub coverage: HashMap<String, Coverage>,
@@ -468,6 +470,7 @@ mod tests {
         };
         let shared: SharedRef = Arc::new(Mutex::new(Shared {
             lib,
+            conf: Default::default(),
             settings,
             paths,
             coverage: HashMap::new(),

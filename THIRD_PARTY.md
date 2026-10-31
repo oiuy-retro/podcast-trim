@@ -1,6 +1,6 @@
 # Third-party software
 
-Podcast Trim links against or runs next to the following projects. This repository contains only the Podcast Trim sources. It does not include FFmpeg, whisper.cpp, or any Whisper model. They must be placed in the same folder as `Podcast Trim.exe`.
+Podcast Trim links against or runs next to the following projects. This repository contains only the Podcast Trim sources. It does not include FFmpeg, whisper.cpp, or any Whisper model. Podcast Trim finds them next to `Podcast Trim.exe`, in a folder inside it, on PATH, or where `configuration.conf` points.
 
 Tested with FFmpeg `9.0.2-essentials_build` (Gyan) and whisper.cpp `b5454` (`whisper-bin-x64.zip`) with `ggml-tiny.en.bin`.
 

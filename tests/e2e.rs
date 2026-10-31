@@ -71,7 +71,7 @@ fn channel_detection() {
     let root = std::env::temp_dir().join(format!("pt-e2e-ch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    let s = podcast_trim::tools::resolve(&Settings::default(), Path::new(&dir)).unwrap();
+    let s = podcast_trim::tools::resolve(&Settings::default(), &auto_conf(), Path::new(&dir)).unwrap();
     let paths = Paths::new(root.join("lib"));
     let make = |name: &str, filter: &str| {
         let out = root.join(name);
@@ -145,6 +145,7 @@ fn real_tools() {
             channels: podcast_trim::store::Channels::Mono,
             ..Default::default()
         },
+        &auto_conf(),
         Path::new(&dir),
     )
     .unwrap();
@@ -185,4 +186,8 @@ fn real_tools() {
     pipeline::mark_delivered(&paths, 1, &mut ep);
     pipeline::regenerate(&env, &s, &paths, 1, &mut ep).unwrap();
     assert!(paths.cleaned(1, &ep).exists());
+}
+
+fn auto_conf() -> podcast_trim::config::Conf {
+    podcast_trim::config::Conf::parse(podcast_trim::config::TEMPLATE)
 }
