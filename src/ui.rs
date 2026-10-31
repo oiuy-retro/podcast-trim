@@ -443,6 +443,7 @@ pub fn run() -> i32 {
     if conf.folder("export").is_empty() && !settings.export_dir.trim().is_empty() {
         let _ = conf.set_folder("export", settings.export_dir.trim());
     }
+    crate::sound::install(&conf, &tools::exe_dir());
     let models = tools::model_names(&conf, &tools::exe_dir());
     let shared: SharedRef = Arc::new(Mutex::new(Shared {
         lib,

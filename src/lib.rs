@@ -2,6 +2,7 @@
 pub mod bitrate;
 pub mod config;
 pub mod cutlist;
+pub mod menusounds;
 pub mod ffargs;
 pub mod pipeline;
 pub mod progress;
