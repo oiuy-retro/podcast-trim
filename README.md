@@ -2,6 +2,8 @@
 
 Windows app that cuts ads out of podcast episodes using a local Whisper transcript and an ad list from an AI you choose, then serves the trimmed episodes to your podcast app as one RSS feed per show.
 
+A built copy is [`Podcast.Trim.exe`](https://github.com/oiuy-retro/podcast-trim/releases/latest/download/Podcast.Trim.exe) on the [latest release](https://github.com/oiuy-retro/podcast-trim/releases/latest).
+
 ## What it does
 
 1. You add a show by pasting its RSS link. Podcast Trim reads the feed and lists its episodes.
