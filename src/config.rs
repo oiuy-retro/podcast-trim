@@ -198,6 +198,23 @@ impl Conf {
                 self.set("folders", &k, &v);
             }
         }
+        // The window's place, only if it was never saved next to the exe.
+        if self.get("window", "width").is_none() {
+            let mut cur = String::new();
+            let mut vals = vec![];
+            for l in &other.lines {
+                if let Some(s) = section_of(l) {
+                    cur = s;
+                } else if cur == "window" {
+                    if let Some(kv) = key_value(l) {
+                        vals.push(kv);
+                    }
+                }
+            }
+            for (k, v) in vals {
+                self.set("window", &k, &v);
+            }
+        }
     }
 
     /// Save to `path`; if that fails, to `fallback`, and keep using it.
@@ -236,6 +253,19 @@ impl Conf {
                 first
             }
         }
+    }
+
+    /// Re-read the file this came from, so lines edited by hand while the
+    /// app was running are kept, change it with `f`, and save.
+    pub fn update_and_save(&mut self, f: impl FnOnce(&mut Conf)) -> Result<(), String> {
+        if let Some(b) = self.path.as_ref().and_then(|p| fs::read(p).ok()) {
+            let mut fresh = Conf::parse(&String::from_utf8_lossy(&b));
+            fresh.path = self.path.take();
+            fresh.fallback = self.fallback.take();
+            *self = fresh;
+        }
+        f(self);
+        self.save()
     }
 
     /// Remember a folder picker's folder and save.
@@ -430,6 +460,30 @@ mod tests {
         assert_eq!(ro.path.as_deref(), Some(fb.join(FILE_NAME).as_path()));
         // Next start reads tools from the exe's file, folders from the fallback.
         assert_eq!(Conf::load(&exe, &fb).folder("export"), "F:\\New");
+        // The window's place saved in the fallback is used too, unless the
+        // exe's own file has one.
+        ro.set("window", "width", "1200");
+        ro.save().unwrap();
+        assert_eq!(Conf::load(&exe, &fb).get("window", "width").as_deref(), Some("1200"));
+        let mut own = Conf::load(&exe, &fb);
+        own.set("window", "width", "1000");
+        own.save().unwrap();
+        assert_eq!(Conf::load(&exe, &fb).get("window", "width").as_deref(), Some("1000"));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn update_keeps_hand_edits() {
+        let d = tmp("update");
+        let mut c = Conf::load(&d, &d.join("fb"));
+        let p = d.join(FILE_NAME);
+        let edited = fs::read_to_string(&p).unwrap() + "\r\n[secret]\r\nmenu-sounds = on\r\n";
+        fs::write(&p, edited).unwrap();
+        c.update_and_save(|c| c.set("window", "width", "1000")).unwrap();
+        let back = Conf::load(&d, &d.join("fb"));
+        assert_eq!(back.get("secret", "menu-sounds").as_deref(), Some("on"));
+        assert_eq!(back.get("window", "width").as_deref(), Some("1000"));
+        assert_eq!(c.get("secret", "menu-sounds").as_deref(), Some("on"));
         fs::remove_dir_all(d).unwrap();
     }
 

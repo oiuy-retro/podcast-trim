@@ -6,7 +6,7 @@ A built copy is [`Podcast.Trim.exe`](https://github.com/oiuy-retro/podcast-trim/
 
 ## What it does
 
-1. You add a show by pasting its RSS link. Podcast Trim reads the feed and lists its episodes.
+1. You add a show by pasting its RSS link. Podcast Trim reads the feed and lists its episodes. **Check for new** reads every show's feed (up to four at a time) and adds new episodes. A show whose feed can't be read is skipped, and the status line says, for example, `Lateral: 2 new episodes. Show B: no new episodes. Show C: couldn't check (feeds.example.com returned HTTP 404).` With more than three shows it gives a total instead.
 2. **Download + transcribe** downloads an episode, records the SHA-256 hash of the file, and transcribes it on the CPU with [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Every transcript line has start and end times. A progress bar at the bottom of the window follows the download, the transcription, and the cutting, and Cancel stops the running step and its ffmpeg or whisper.cpp process.
 3. **Copy AI prompt** copies a ready-made prompt plus the transcript to the clipboard. Paste it into any AI chat. No AI service is built in and nothing is sent anywhere by the app.
 4. Paste the AI's reply into the reply box and press **Check cuts**. The reply must be a list of ad time ranges (format below). Podcast Trim never runs commands from the reply. It checks that every range is inside the episode, ends after it starts, and does not overlap another range, then shows the cut list and the exact ffmpeg command it will run.
@@ -110,6 +110,7 @@ export = E:\Podcasts
 - Anything else is a file, or a folder holding it. Relative paths start from the folder `Podcast Trim.exe` is in, and `%VARIABLES%` such as `%USERPROFILE%` are expanded. If the file isn't there, the app says which line to fix instead of looking elsewhere.
 - `whisper-model = auto` lists every `ggml-*.bin` found the `auto` way in Options. A file path uses that model only.
 - `[folders]` holds the folder each folder picker last used. The app rewrites only that line, so your comments and other edits stay. A remembered folder that no longer exists (for example an unplugged drive) opens at its nearest parent that still exists.
+- `[window]` holds the window's position, size and whether it was maximized (`x`, `y`, `width`, `height` in screen pixels, `maximized = yes` or `no`). The app writes it when it closes, after reading the file again so edits made while it was open stay. Delete the section to open centred at the default size. A saved position that is off every screen (for example on a monitor that is no longer connected) is moved back onto the nearest one.
 - If the folder `Podcast Trim.exe` is in can't be written to (for example under Program Files), the file is read from there and changes are saved to `%AppData%\Podcast Trim\configuration.conf` instead.
 - Unknown lines and sections are ignored.
 
@@ -144,7 +145,7 @@ cargo clippy --all-targets
 
 ## Look
 
-The window copies the general look of late-1990s game dialogs: olive panels, light text with khaki for the active tab and checked options, a mustard selection bar, 1-pixel light and dark bevels, and the app's own caption bar, tabs, buttons, and scroll bars. It is drawn with plain Win32 and GDI. Text uses Tahoma, which ships with Windows, at 13 pixels without smoothing. The progress bar copies the segmented bar of the game's loading dialog. The window can be resized from the grip in its bottom-right corner, down to 900 by 600 pixels. No game assets are included.
+The window copies the general look of late-1990s game dialogs: olive panels, light text with khaki for the active tab and checked options, a mustard selection bar, 1-pixel light and dark bevels, and the app's own caption bar, tabs, buttons, and scroll bars. It is drawn with plain Win32 and GDI. Text uses Tahoma, which ships with Windows, at 13 pixels without smoothing. The progress bar copies the segmented bar of the game's loading dialog. The window can be resized from any edge or the grip in its bottom-right corner, down to 900 by 600 pixels, and maximized with the caption button or by double-clicking the caption. The lists and text boxes grow with it and the buttons stay with their boxes. No game assets are included.
 
 ## License
 

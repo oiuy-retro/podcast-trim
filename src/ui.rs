@@ -9,7 +9,8 @@ use podcast_trim::pipeline::{self, Env};
 use podcast_trim::server::{self, Shared, SharedRef};
 use podcast_trim::store::{self, load_json, save_json, Library, Paths, Settings, State};
 use podcast_trim::config::Conf;
-use podcast_trim::{ffargs, prompt, rss, tools};
+use podcast_trim::winstate::{self, WinState};
+use podcast_trim::{ffargs, prompt, refresh, rss, tools};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
@@ -82,6 +83,7 @@ const B_TAB_OPT: i32 = 211;
 const B_MIN: i32 = 215;
 const B_CLOSE: i32 = 216;
 const B_CANCEL: i32 = 217;
+const B_MAX: i32 = 218;
 const ID_PROGRESS: i32 = 107;
 const B_TOKEN: i32 = 212;
 const OPT_BASE: i32 = 300;
@@ -445,6 +447,7 @@ pub fn run() -> i32 {
     }
     crate::sound::install(&conf, &tools::exe_dir());
     let models = tools::model_names(&conf, &tools::exe_dir());
+    let saved = WinState::from_conf(&conf);
     let shared: SharedRef = Arc::new(Mutex::new(Shared {
         lib,
         conf,
@@ -501,26 +504,25 @@ pub fn run() -> i32 {
         DPI.store(dpi, std::sync::atomic::Ordering::Relaxed);
         let (w, h) = (scale(WIN_W, dpi), scale(WIN_H, dpi));
         // Borderless: the app draws its own VGUI-style caption and frame.
-        let style = WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-        let r = RECT {
-            left: 0,
-            top: 0,
-            right: w,
-            bottom: h,
-        };
-        let (sx, sy) = (
-            (GetSystemMetrics(SM_CXSCREEN) - w) / 2,
-            (GetSystemMetrics(SM_CYSCREEN) - h) / 2,
-        );
+        // WS_THICKFRAME gives Windows' resizing and snapping; WM_NCCALCSIZE
+        // takes the system frame away again.
+        let style = WS_POPUP
+            | WS_THICKFRAME
+            | WS_SYSMENU
+            | WS_MINIMIZEBOX
+            | WS_MAXIMIZEBOX
+            | WS_CLIPCHILDREN;
+        let (place, maximized) = start_rect(saved, (w, h));
+        *NORMAL.lock().unwrap() = place;
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("PodcastTrimWindow"),
             w!("Podcast Trim"),
             style,
-            sx.max(0),
-            sy.max(0),
-            r.right - r.left,
-            r.bottom - r.top,
+            place.0,
+            place.1,
+            place.2,
+            place.3,
             None,
             None,
             instance,
@@ -603,7 +605,7 @@ pub fn run() -> i32 {
             Err(e) => status(ui, &e),
         });
         refresh_lists();
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW });
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             if IsDialogMessageW(hwnd, &msg).as_bool() {
@@ -614,6 +616,55 @@ pub fn run() -> i32 {
         }
     }
     0
+}
+
+/// The window's last restored (not maximized or minimized) screen rect.
+static NORMAL: Mutex<winstate::Rect> = Mutex::new((0, 0, 0, 0));
+
+/// Work area (left, top, right, bottom) of the monitor nearest `r`.
+unsafe fn work_area(r: winstate::Rect) -> (i32, i32, i32, i32) {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    let rc = RECT {
+        left: r.0,
+        top: r.1,
+        right: r.0 + r.2,
+        bottom: r.1 + r.3,
+    };
+    let mon = MonitorFromRect(&rc, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetMonitorInfoW(mon, &mut mi).as_bool() {
+        let w = mi.rcWork;
+        (w.left, w.top, w.right, w.bottom)
+    } else {
+        (0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
+    }
+}
+
+/// Where the window opens: the saved place moved fully onto the nearest
+/// monitor, or centred on the main monitor at the design size.
+unsafe fn start_rect(saved: Option<WinState>, min: (i32, i32)) -> (winstate::Rect, bool) {
+    match saved {
+        Some(s) => (winstate::fit(s.rect, work_area(s.rect), min), s.maximized),
+        None => (winstate::centred(min, work_area((0, 0, 1, 1))), false),
+    }
+}
+
+/// Remember the window's place in configuration.conf's `[window]` section.
+fn save_window_state(hwnd: HWND) {
+    let maximized = unsafe { IsZoomed(hwnd).as_bool() };
+    let rect = *NORMAL.lock().unwrap();
+    if rect.2 <= 0 || rect.3 <= 0 {
+        return;
+    }
+    if let Some(shared) = with(|ui| ui.shared.clone()) {
+        let mut sh = shared.lock().unwrap();
+        let _ = sh
+            .conf
+            .update_and_save(|c| WinState { rect, maximized }.to_conf(c));
+    }
 }
 
 fn status(ui: &Ui, msg: &str) {
@@ -820,12 +871,7 @@ fn boxed(
 
 /// Base rect moved by its anchor for a window `dx`/`dy` larger than 900x600.
 fn anchored(r: (i32, i32, i32, i32), a: Anchor, dx: i32, dy: i32) -> (i32, i32, i32, i32) {
-    let f = |v: f32, d: i32| (v * d as f32).round() as i32;
-    let x0 = r.0 + f(a.0, dx);
-    let x1 = r.0 + r.2 + f(a.1, dx);
-    let y0 = r.1 + f(a.2, dy);
-    let y1 = r.1 + r.3 + f(a.3, dy);
-    (x0, y0, (x1 - x0).max(0), (y1 - y0).max(0))
+    winstate::anchored(r, (a.0, a.1, a.2, a.3), dx, dy)
 }
 
 /// Place everything for the current client size.
@@ -928,6 +974,17 @@ fn build_controls(instance: HINSTANCE) {
             "",
             BS_OWNERDRAW as u32,
             B_MIN,
+            PAGE_ALL,
+            (WIN_W - 70, 5, 18, 17),
+        );
+        child(
+            ui,
+            instance,
+            ui.hwnd,
+            bt,
+            "",
+            BS_OWNERDRAW as u32,
+            B_MAX,
             PAGE_ALL,
             (WIN_W - 48, 5, 18, 17),
         );
@@ -1420,7 +1477,7 @@ fn update_buttons() {
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(ui.ctl[&id], on);
         };
         en(B_ADD, idle);
-        en(B_REFRESH, idle && show.is_some());
+        en(B_REFRESH, idle && !ui.show_ids.is_empty());
         en(
             B_PROCESS,
             idle && matches!(st, Some(State::New | State::Downloaded)),
@@ -1582,24 +1639,26 @@ fn on_command(id: i32, code: u32) {
             with(|ui| set_text(ui.ctl[&ID_URL], ""));
         }
         B_REFRESH => {
-            let Some(show) = show else { return };
-            background("Checking for new episodes", move |shared| {
-                let url = shared
+            const STAGE: &str = "Checking every show for new episodes";
+            background(STAGE, move |shared| {
+                let targets: Vec<refresh::Target> = shared
                     .lock()
                     .unwrap()
                     .lib
-                    .show(show)
-                    .map(|s| s.feed_url.clone())
-                    .ok_or("show is gone")?;
-                let feed = rss::parse(&String::from_utf8_lossy(&net::get(&url)?))?;
-                let mut sh = shared.lock().unwrap();
-                let s = sh.lib.show_mut(show).ok_or("show is gone")?;
-                let n = pipeline::merge_feed(s, &feed);
-                Ok(if n == 0 {
-                    "No new episodes.".to_string()
-                } else {
-                    format!("{}.", store::plural(n, "new episode"))
-                })
+                    .shows
+                    .iter()
+                    .map(|s| {
+                        let name = if s.title.trim().is_empty() { &s.feed_url } else { &s.title };
+                        (s.id, name.clone(), s.feed_url.clone())
+                    })
+                    .collect();
+                let apply = |id: u32, feed: &rss::SourceFeed| {
+                    let mut sh = shared.lock().unwrap();
+                    sh.lib.show_mut(id).map(|s| pipeline::merge_feed(s, feed))
+                };
+                let done = |n: usize, total: usize| set_progress(STAGE, n as f64 / total as f64);
+                let out = refresh::check_all(&targets, 4, &net::get, &apply, &cancelled, &done);
+                Ok(refresh::summary(&out, targets.len(), out.len() < targets.len()))
             });
         }
         B_PROCESS => {
@@ -1781,6 +1840,10 @@ fn on_command(id: i32, code: u32) {
         B_MIN => unsafe {
             let _ = ShowWindow(hwnd, SW_MINIMIZE);
         },
+        B_MAX => unsafe {
+            let zoomed = IsZoomed(hwnd).as_bool();
+            let _ = ShowWindow(hwnd, if zoomed { SW_RESTORE } else { SW_MAXIMIZE });
+        },
         B_CLOSE => unsafe {
             let _ = DestroyWindow(hwnd);
         },
@@ -1961,7 +2024,9 @@ unsafe fn paint(hwnd: HWND) {
                 bevel(dc, r, *raised);
             }
         }
-        grip(dc, &rc);
+        if !IsZoomed(hwnd).as_bool() {
+            grip(dc, &rc);
+        }
         for (r, s, p, kind) in &ui.labels {
             if *p != page {
                 continue;
@@ -2272,7 +2337,7 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
     let label = String::from_utf16_lossy(&buf[..got as usize]);
     let flags = DT_LEFT | DT_SINGLELINE | DT_VCENTER;
     match id {
-        B_MIN | B_CLOSE => {
+        B_MIN | B_MAX | B_CLOSE => {
             bevel(dc, &r, !pressed);
             let pen = CreatePen(PS_SOLID, 1, COLORREF(LIGHT));
             let o = SelectObject(dc, pen);
@@ -2280,6 +2345,23 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
             if id == B_MIN {
                 for k in 0..2 {
                     line(dc, cx - 4, cy + 3 + k, cx + 3, cy + 3 + k);
+                }
+            } else if id == B_MAX {
+                // A box with a thick top; two overlapping boxes when maximized.
+                let zoomed = IsZoomed(GetParent(dis.hwndItem).unwrap_or_default()).as_bool();
+                let boxed = |l: i32, t: i32, w: i32, h: i32| {
+                    line(dc, l, t, l + w, t);
+                    line(dc, l, t + 1, l + w, t + 1);
+                    line(dc, l, t, l, t + h);
+                    line(dc, l + w - 1, t, l + w - 1, t + h);
+                    line(dc, l, t + h - 1, l + w, t + h - 1);
+                };
+                if zoomed {
+                    boxed(cx - 2, cy - 5, 7, 6);
+                    fill(dc, &RECT { left: cx - 5, top: cy - 2, right: cx + 2, bottom: cy + 4 }, BG);
+                    boxed(cx - 5, cy - 2, 7, 6);
+                } else {
+                    boxed(cx - 4, cy - 4, 9, 8);
                 }
             } else {
                 for k in 0..2 {
@@ -2634,6 +2716,39 @@ unsafe extern "system" fn scroll_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     }
 }
 
+/// Resize hit test for a borderless window `w`x`h`: `edge`-wide borders and
+/// a `corner`-sized bottom-right grip. 0 means not on an edge.
+fn edge_hit(x: i32, y: i32, w: i32, h: i32, edge: i32, corner: i32) -> u32 {
+    if x >= w - corner && y >= h - corner {
+        return HTBOTTOMRIGHT;
+    }
+    let (l, r, t, b) = (x < edge, x >= w - edge, y < edge, y >= h - edge);
+    match (l, r, t, b) {
+        (true, _, true, _) => HTTOPLEFT,
+        (_, true, true, _) => HTTOPRIGHT,
+        (true, _, _, true) => HTBOTTOMLEFT,
+        (_, true, _, true) => HTBOTTOMRIGHT,
+        (true, ..) => HTLEFT,
+        (_, true, ..) => HTRIGHT,
+        (_, _, true, _) => HTTOP,
+        (.., true) => HTBOTTOM,
+        _ => 0,
+    }
+}
+
+/// Note the window's rect while it is neither maximized nor minimized.
+fn remember_normal(hwnd: HWND) {
+    unsafe {
+        if IsZoomed(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd, &mut r).is_ok() {
+            *NORMAL.lock().unwrap() = (r.left, r.top, r.right - r.left, r.bottom - r.top);
+        }
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {
@@ -2650,13 +2765,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let d = DPI.load(std::sync::atomic::Ordering::Relaxed);
             let mut rc = RECT::default();
             let _ = GetClientRect(hwnd, &mut rc);
-            let g = scale(16, d);
-            if !IsZoomed(hwnd).as_bool() && pt.x >= rc.right - g && pt.y >= rc.bottom - g {
-                return LRESULT(HTBOTTOMRIGHT as isize);
+            if !IsZoomed(hwnd).as_bool() {
+                let hit = edge_hit(pt.x, pt.y, rc.right, rc.bottom, scale(5, d), scale(16, d));
+                if hit != 0 {
+                    return LRESULT(hit as isize);
+                }
             }
             if pt.y >= 0 && pt.y < scale(CAPTION_H, d) {
                 return LRESULT(HTCAPTION as isize);
             }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_NCCALCSIZE => {
+            // No system frame: the client area is the whole window (the
+            // first RECT of either form of lParam). A maximized window hangs
+            // over the monitor by the frame size, so fit its client area to
+            // the work area instead.
+            if wp.0 != 0 && IsZoomed(hwnd).as_bool() {
+                let p = &mut *(lp.0 as *mut NCCALCSIZE_PARAMS);
+                let r = p.rgrc[0];
+                let w = work_area((r.left, r.top, r.right - r.left, r.bottom - r.top));
+                p.rgrc[0] = RECT {
+                    left: w.0,
+                    top: w.1,
+                    right: w.2,
+                    bottom: w.3,
+                };
+            }
+            LRESULT(0)
+        }
+        WM_NCACTIVATE => LRESULT(1),
+        WM_MOVE | WM_EXITSIZEMOVE => {
+            remember_normal(hwnd);
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_GETMINMAXINFO => {
@@ -2667,7 +2807,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_SIZE => {
-            layout();
+            if wp.0 as u32 != SIZE_MINIMIZED {
+                remember_normal(hwnd);
+                layout();
+                if let Some(b) = with(|ui| ui.ctl.get(&B_MAX).copied()).flatten() {
+                    let _ = InvalidateRect(b, None, false);
+                }
+            }
             LRESULT(0)
         }
         WM_MODEL_PICK => {
@@ -2743,6 +2889,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_DESTROY => {
+            save_window_state(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
         }
