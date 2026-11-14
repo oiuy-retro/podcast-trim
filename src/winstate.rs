@@ -73,6 +73,39 @@ pub fn anchored(r: Rect, a: (f32, f32, f32, f32), dx: i32, dy: i32) -> Rect {
     (x0, y0, (x1 - x0).max(0), (y1 - y0).max(0))
 }
 
+/// Position (relative to the monitor origin) and size of a maximized
+/// window that covers `work` (left, top, right, bottom) on a monitor at
+/// `mon` (same form), with `border` pixels (x, y) hanging off each edge so
+/// the resize frame sits outside the work area.
+pub fn maximized(
+    work: (i32, i32, i32, i32),
+    mon: (i32, i32, i32, i32),
+    border: (i32, i32),
+) -> Rect {
+    (
+        (work.0 - mon.0) - border.0,
+        (work.1 - mon.1) - border.1,
+        (work.2 - work.0) + 2 * border.0,
+        (work.3 - work.1) + 2 * border.1,
+    )
+}
+
+/// Client rectangle (left, top, right, bottom) of a maximized window
+/// whose window rect is `window` (same form): the overlap of the window
+/// and the monitor work area, so the app fills the work area and does
+/// not spill into the hanging frame.
+pub fn maximized_client(
+    window: (i32, i32, i32, i32),
+    work: (i32, i32, i32, i32),
+) -> (i32, i32, i32, i32) {
+    (
+        window.0.max(work.0),
+        window.1.max(work.1),
+        window.2.min(work.2),
+        window.3.min(work.3),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +186,60 @@ mod tests {
             assert!(r[1].0 + r[1].2 < r[2].0, "dx {dx}: {r:?}");
             assert_eq!(r[2].0 + r[2].2, 876 + dx);
         }
+    }
+
+    #[test]
+    fn maximized_covers_the_work_area_with_a_hanging_frame() {
+        let border = (8, 8);
+        // Primary, taskbar at the bottom.
+        assert_eq!(
+            maximized((0, 0, 1920, 1040), (0, 0, 1920, 1080), border),
+            (-8, -8, 1936, 1056)
+        );
+        // Taskbar at the top: the window starts below it and still hangs
+        // eight pixels past the work area on every side.
+        assert_eq!(
+            maximized((0, 40, 1920, 1080), (0, 0, 1920, 1080), border),
+            (-8, 32, 1936, 1056)
+        );
+        // Second monitor to the right: position is relative to that monitor.
+        assert_eq!(
+            maximized((1920, 0, 3840, 1040), (1920, 0, 3840, 1080), border),
+            (-8, -8, 1936, 1056)
+        );
+        // Short, non-16:9 work area, still covers it exactly plus the frame.
+        assert_eq!(
+            maximized((0, 0, 1280, 724), (0, 0, 1280, 800), (8, 8)),
+            (-8, -8, 1296, 740)
+        );
+        // Unequal frame on x and y.
+        assert_eq!(
+            maximized((0, 0, 1920, 1040), (0, 0, 1920, 1080), (7, 8)),
+            (-7, -8, 1934, 1056)
+        );
+    }
+
+    #[test]
+    fn maximized_client_is_the_overlap_with_the_work_area() {
+        // Usual hang: client is exactly the work area.
+        assert_eq!(
+            maximized_client((-8, -8, 1928, 1048), (0, 0, 1920, 1040)),
+            (0, 0, 1920, 1040)
+        );
+        // Already the work area: unchanged.
+        assert_eq!(
+            maximized_client((0, 0, 1920, 1040), (0, 0, 1920, 1040)),
+            (0, 0, 1920, 1040)
+        );
+        // Window short of the work area: cannot grow past the window.
+        assert_eq!(
+            maximized_client((0, 0, 1920, 1010), (0, 0, 1920, 1040)),
+            (0, 0, 1920, 1010)
+        );
+        // Taskbar on the left; window hangs off every side.
+        assert_eq!(
+            maximized_client((40 - 8, -8, 1920 + 8, 1080 + 8), (40, 0, 1920, 1080)),
+            (40, 0, 1920, 1080)
+        );
     }
 }

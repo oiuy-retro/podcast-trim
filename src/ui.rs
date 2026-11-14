@@ -643,6 +643,35 @@ unsafe fn work_area(r: winstate::Rect) -> (i32, i32, i32, i32) {
     }
 }
 
+/// Monitor and work-area rects of the screen that contains `hwnd`.
+unsafe fn monitor_work(hwnd: HWND) -> Option<(RECT, RECT)> {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetMonitorInfoW(mon, &mut mi).as_bool() {
+        Some((mi.rcMonitor, mi.rcWork))
+    } else {
+        None
+    }
+}
+
+/// The resize-frame thickness Windows hangs off a maximized window, in
+/// (horizontal, vertical) pixels.
+fn frame_border() -> (i32, i32) {
+    unsafe {
+        let pad = GetSystemMetrics(SM_CXPADDEDBORDER);
+        (
+            GetSystemMetrics(SM_CXSIZEFRAME) + pad,
+            GetSystemMetrics(SM_CYSIZEFRAME) + pad,
+        )
+    }
+}
+
 /// Where the window opens: the saved place moved fully onto the nearest
 /// monitor, or centred on the main monitor at the design size.
 unsafe fn start_rect(saved: Option<WinState>, min: (i32, i32)) -> (winstate::Rect, bool) {
@@ -2779,18 +2808,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_NCCALCSIZE => {
             // No system frame: the client area is the whole window (the
             // first RECT of either form of lParam). A maximized window hangs
-            // over the monitor by the frame size, so fit its client area to
-            // the work area instead.
-            if wp.0 != 0 && IsZoomed(hwnd).as_bool() {
-                let p = &mut *(lp.0 as *mut NCCALCSIZE_PARAMS);
-                let r = p.rgrc[0];
-                let w = work_area((r.left, r.top, r.right - r.left, r.bottom - r.top));
-                p.rgrc[0] = RECT {
-                    left: w.0,
-                    top: w.1,
-                    right: w.2,
-                    bottom: w.3,
-                };
+            // over the work area by the frame size; clip the client to the
+            // overlap with that work area so the app fills the screen down
+            // to the taskbar and does not paint into the overhang.
+            let rect = if wp.0 != 0 {
+                &mut (*(lp.0 as *mut NCCALCSIZE_PARAMS)).rgrc[0]
+            } else {
+                &mut *(lp.0 as *mut RECT)
+            };
+            if IsZoomed(hwnd).as_bool() {
+                if let Some((_, work)) = monitor_work(hwnd) {
+                    let c = winstate::maximized_client(
+                        (rect.left, rect.top, rect.right, rect.bottom),
+                        (work.left, work.top, work.right, work.bottom),
+                    );
+                    if c.2 > c.0 && c.3 > c.1 {
+                        *rect = RECT {
+                            left: c.0,
+                            top: c.1,
+                            right: c.2,
+                            bottom: c.3,
+                        };
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -2804,6 +2844,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let mm = &mut *(lp.0 as *mut MINMAXINFO);
             mm.ptMinTrackSize.x = scale(WIN_W, d);
             mm.ptMinTrackSize.y = scale(WIN_H, d);
+            // Defaults are for the primary monitor and a system caption
+            // this window does not have, which leaves a gap at the bottom
+            // when maximized. Size it to this monitor's work area, plus
+            // the hanging resize frame Windows expects.
+            if let Some((mon, work)) = monitor_work(hwnd) {
+                let (x, y, w, h) = winstate::maximized(
+                    (work.left, work.top, work.right, work.bottom),
+                    (mon.left, mon.top, mon.right, mon.bottom),
+                    frame_border(),
+                );
+                mm.ptMaxPosition.x = x;
+                mm.ptMaxPosition.y = y;
+                mm.ptMaxSize.x = w;
+                mm.ptMaxSize.y = h;
+            }
             LRESULT(0)
         }
         WM_SIZE => {
