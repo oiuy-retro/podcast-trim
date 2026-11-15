@@ -10,7 +10,7 @@ use podcast_trim::server::{self, Shared, SharedRef};
 use podcast_trim::store::{self, load_json, save_json, Library, Paths, Settings, State};
 use podcast_trim::config::Conf;
 use podcast_trim::winstate::{self, WinState};
-use podcast_trim::{ffargs, prompt, refresh, rss, tools};
+use podcast_trim::{ffargs, prompt, refresh, rss, tools, transcript};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
@@ -1440,6 +1440,7 @@ fn show_details() {
                         ));
                         for c in &e.record.cuts {
                             t.push_str(&format!("  {} - {}\n", format_time(c.start), format_time(c.end)));
+                            append_cut_words(&mut t, &e.record.transcript, c.start, c.end);
                         }
                         t.push_str(if e.state == State::Ready {
                             "\nIn the feed. It is deleted after one full download."
@@ -1456,6 +1457,18 @@ fn show_details() {
             set_text(ui.ctl[&ID_VIEW], &text);
         }
     });
+}
+
+/// Words from the transcript that overlap a cut, indented under its times.
+fn append_cut_words(t: &mut String, transcript: &str, start: f64, end: f64) {
+    let words = transcript::text_in_range(transcript, start, end);
+    t.push_str("  ");
+    if words.is_empty() {
+        t.push_str("(no transcript text in this range)");
+    } else {
+        t.push_str(&words);
+    }
+    t.push('\n');
 }
 
 /// e.g. "Source mp3 55 kbps stereo (identical channels) -> Opus 32 kbps mono (Auto)".
@@ -1768,6 +1781,8 @@ fn on_command(id: i32, code: u32) {
                                 format_time(c.end),
                                 format_time(c.end - c.start)
                             ));
+                            append_cut_words(&mut t, &ep.record.transcript, c.start, c.end);
+                            t.push('\n');
                         }
                         t.push_str("\nffmpeg command the app will run:\n");
                         t.push_str(&ffargs::display("ffmpeg.exe", &args));
