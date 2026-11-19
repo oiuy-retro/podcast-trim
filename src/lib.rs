@@ -9,6 +9,7 @@ pub mod progress;
 pub mod prompt;
 pub mod refresh;
 pub mod rss;
+pub mod seen;
 pub mod server;
 pub mod store;
 pub mod tools;

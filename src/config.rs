@@ -8,6 +8,9 @@
 //!   or a file path. Relative paths start from the exe's folder and
 //!   `%VARIABLES%` are expanded. A missing key means `auto`.
 //! - `[folders]`: one line per folder picker, rewritten by the app.
+//! - `[episodes]` `new-on-add`: how many of a new show's newest episodes are
+//!   listed as NEW (default 1); older ones are listed as OLD.
+//! - `[prompt]` `bulk-size`: most episodes in one bulk AI prompt (default 3).
 //! - Unknown keys and sections are ignored. When the app changes a value it
 //!   rewrites only that line, so comments and hand edits stay.
 //! - If the exe's folder can't be written to, the file goes to
@@ -47,7 +50,33 @@ whisper-model = auto
 
 [folders]
 export =
+
+# [episodes] new-on-add = how many of a show's newest episodes are listed as
+# NEW when the show is added (0 or more). Older ones are listed as OLD
+# (already seen). Episodes found later by Check for new are always NEW.
+# [prompt] bulk-size = the most episodes one bulk AI prompt holds (1 to 20).
+# Both can also be changed in Options.
+
+[episodes]
+new-on-add = 1
+
+[prompt]
+bulk-size = 3
 ";
+
+/// Default for `[episodes] new-on-add`.
+pub const NEW_ON_ADD_DEFAULT: usize = 1;
+/// Highest `[episodes] new-on-add` accepted.
+pub const NEW_ON_ADD_MAX: usize = 10_000;
+/// Default for `[prompt] bulk-size`.
+pub const BULK_SIZE_DEFAULT: usize = 3;
+/// Highest `[prompt] bulk-size` accepted; very long prompts make AIs sloppy.
+pub const BULK_SIZE_MAX: usize = 20;
+
+/// A whole number from `text` within `lo..=hi`, or None.
+pub fn parse_count(text: &str, lo: usize, hi: usize) -> Option<usize> {
+    text.trim().parse::<usize>().ok().filter(|n| (lo..=hi).contains(n))
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Conf {
@@ -277,6 +306,20 @@ impl Conf {
     pub fn folder(&self, key: &str) -> String {
         self.get("folders", key).unwrap_or_default()
     }
+
+    /// `[episodes] new-on-add`; missing or invalid means the default (1).
+    pub fn new_on_add(&self) -> usize {
+        self.get("episodes", "new-on-add")
+            .and_then(|v| parse_count(&v, 0, NEW_ON_ADD_MAX))
+            .unwrap_or(NEW_ON_ADD_DEFAULT)
+    }
+
+    /// `[prompt] bulk-size`; missing or invalid means the default (3).
+    pub fn bulk_size(&self) -> usize {
+        self.get("prompt", "bulk-size")
+            .and_then(|v| parse_count(&v, 1, BULK_SIZE_MAX))
+            .unwrap_or(BULK_SIZE_DEFAULT)
+    }
 }
 
 /// `%NAME%` replaced by the environment variable; unknown names stay as is.
@@ -409,6 +452,27 @@ mod tests {
         let t2 = Conf::parse(TEMPLATE);
         assert_eq!(t2.get("tools", "whisper-cli").unwrap(), "auto");
         assert_eq!(t2.folder("export"), "");
+    }
+
+    #[test]
+    fn count_defaults() {
+        // A configuration.conf from 0.1.1 has neither key.
+        let old = Conf::parse("[tools]\nffmpeg = auto\n[folders]\nexport =\n");
+        assert_eq!((old.new_on_add(), old.bulk_size()), (1, 3));
+        let t = Conf::parse(TEMPLATE);
+        assert_eq!((t.new_on_add(), t.bulk_size()), (NEW_ON_ADD_DEFAULT, BULK_SIZE_DEFAULT));
+        let mut c = Conf::parse("[Episodes]\nNew-On-Add = 5\n[prompt]\nbulk-size = 2\n");
+        assert_eq!((c.new_on_add(), c.bulk_size()), (5, 2));
+        c.set("episodes", "new-on-add", "0");
+        c.set("prompt", "bulk-size", "0");
+        assert_eq!((c.new_on_add(), c.bulk_size()), (0, 3));
+        c.set("episodes", "new-on-add", "lots");
+        c.set("prompt", "bulk-size", "21");
+        assert_eq!((c.new_on_add(), c.bulk_size()), (1, 3));
+        c.set("prompt", "bulk-size", " 20 ");
+        assert_eq!(c.bulk_size(), 20);
+        assert_eq!(parse_count("-1", 0, 5), None);
+        assert_eq!(parse_count("4", 0, 5), Some(4));
     }
 
     #[test]
