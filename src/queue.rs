@@ -5,7 +5,6 @@
 //! left out for now because cancel, the child-process slot, and the progress
 //! bar are all global.
 
-use crate::config::Conf;
 use crate::store::{self, State};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -96,47 +95,6 @@ impl AddError {
             AddError::AlreadyQueued => "already in the queue",
             AddError::InProgress => "already being processed",
             AddError::NotEligible => "already transcribed",
-        }
-    }
-}
-
-/// How the queue is shown in the window. Picked at startup from the
-/// `PODCAST_TRIM_QUEUE_UI` environment variable or `[secret] queue-ui` in
-/// configuration.conf (`inline`, `tab`, or `strip`). Default is inline.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum QueueUi {
-    #[default]
-    Inline,
-    Tab,
-    Strip,
-}
-
-impl QueueUi {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "inline" | "a" => Some(QueueUi::Inline),
-            "tab" | "b" => Some(QueueUi::Tab),
-            "strip" | "c" => Some(QueueUi::Strip),
-            _ => None,
-        }
-    }
-
-    pub fn from_env_and_conf(conf: &Conf) -> Self {
-        if let Ok(v) = std::env::var("PODCAST_TRIM_QUEUE_UI") {
-            if let Some(u) = Self::parse(&v) {
-                return u;
-            }
-        }
-        conf.get("secret", "queue-ui")
-            .and_then(|v| Self::parse(&v))
-            .unwrap_or(QueueUi::Inline)
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            QueueUi::Inline => "inline",
-            QueueUi::Tab => "tab",
-            QueueUi::Strip => "strip",
         }
     }
 }
@@ -624,20 +582,5 @@ mod tests {
         assert_eq!(JobStatus::Done.list_tag(), None);
         assert!(Queue::can_enqueue(State::New));
         assert!(!Queue::can_enqueue(State::Ready));
-    }
-
-    #[test]
-    fn queue_ui_parse() {
-        assert_eq!(QueueUi::parse("Tab"), Some(QueueUi::Tab));
-        assert_eq!(QueueUi::parse("c"), Some(QueueUi::Strip));
-        assert_eq!(QueueUi::parse("inline"), Some(QueueUi::Inline));
-        assert_eq!(QueueUi::parse("nope"), None);
-        let c = Conf::parse("[secret]\nqueue-ui = strip\n");
-        std::env::remove_var("PODCAST_TRIM_QUEUE_UI");
-        assert_eq!(QueueUi::from_env_and_conf(&c), QueueUi::Strip);
-        assert_eq!(
-            QueueUi::from_env_and_conf(&Conf::parse("")),
-            QueueUi::Inline
-        );
     }
 }

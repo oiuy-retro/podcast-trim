@@ -7,7 +7,7 @@ use crate::net;
 use podcast_trim::config::Conf;
 use podcast_trim::cutlist::{format_time, removed_seconds, Cut};
 use podcast_trim::pipeline::{self, Env};
-use podcast_trim::queue::{self, JobId, Queue, QueueUi};
+use podcast_trim::queue::{self, JobId, Queue};
 use podcast_trim::server::{self, Shared, SharedRef};
 use podcast_trim::store::{self, load_json, save_json, Library, Paths, Settings, State};
 use podcast_trim::winstate::{self, WinState};
@@ -85,14 +85,7 @@ const B_MIN: i32 = 215;
 const B_CLOSE: i32 = 216;
 const B_CANCEL: i32 = 217;
 const B_MAX: i32 = 218;
-const B_TAB_QUEUE: i32 = 219;
-const B_Q_UP: i32 = 220;
-const B_Q_DOWN: i32 = 221;
-const B_Q_REMOVE: i32 = 222;
-const B_Q_CLEAR: i32 = 223;
-const B_Q_TOGGLE: i32 = 224;
 const ID_PROGRESS: i32 = 107;
-const ID_QUEUE: i32 = 108;
 const B_TOKEN: i32 = 212;
 const OPT_BASE: i32 = 300;
 
@@ -124,9 +117,6 @@ struct Ui {
     pending: Option<(u32, String, Vec<Cut>)>,
     busy: bool,
     page: u8,
-    queue_ui: QueueUi,
-    /// Strip layout only: the queue list is shown above the progress bar.
-    queue_strip_open: bool,
     /// Load in-progress jobs as-is and draw a fake progress state (screenshots).
     queue_preview: bool,
     token_on: bool,
@@ -465,7 +455,6 @@ pub fn run() -> i32 {
         Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true"),
         Err(_) => false,
     };
-    let queue_ui = QueueUi::from_env_and_conf(&conf);
     let queue = if queue_preview {
         Queue::load_as_saved(&paths.queue())
     } else {
@@ -571,8 +560,6 @@ pub fn run() -> i32 {
             pending: None,
             busy: false,
             page: PAGE_MAIN,
-            queue_ui,
-            queue_strip_open: queue_preview || pending_on_start > 0,
             queue_preview,
             token_on,
             channels,
@@ -635,9 +622,6 @@ pub fn run() -> i32 {
         refresh_lists();
         if queue_preview {
             apply_queue_preview();
-            if queue_ui == QueueUi::Tab {
-                set_page(PAGE_QUEUE);
-            }
         } else if pending_on_start > 0 {
             with(|ui| {
                 status(
@@ -810,13 +794,6 @@ const LIST_MULTI: u32 = LIST | LBS_EXTENDEDSEL as u32;
 const PAGE_ALL: u8 = 0;
 const PAGE_MAIN: u8 = 1;
 const PAGE_OPT: u8 = 2;
-const PAGE_QUEUE: u8 = 3;
-
-/// Height in 96-DPI pixels of the expanded queue strip (option C).
-const STRIP_H: i32 = 144;
-const STRIP_HEAD: i32 = 26;
-/// Status line y in the 900x600 layout; the strip sits just above it.
-const STATUS_Y: i32 = 516;
 
 /// Window size in 96-DPI pixels.
 const WIN_W: i32 = 900;
@@ -970,8 +947,6 @@ fn layout() {
         let _ = GetClientRect(ui.hwnd, &mut rc);
         let (w, h) = (rc.right * 96 / d, rc.bottom * 96 / d);
         let (dx, dy) = ((w - WIN_W).max(0), (h - WIN_H).max(0));
-        let pending = ui.shared.lock().unwrap().queue.jobs().len();
-        let strip = strip_height(ui, pending);
         let place = |h: HWND, x: i32, y: i32, cw: i32, ch: i32| {
             let _ = SetWindowPos(
                 h,
@@ -984,19 +959,7 @@ fn layout() {
             );
         };
         for i in 0..ui.items.len() {
-            let base = ui.items[i].1;
-            if base.1 >= 900 {
-                continue;
-            }
-            let (x, mut y, cw, mut ch) = anchored(base, ui.items[i].2, dx, dy);
-            if strip > 0 && base.1 < STATUS_Y {
-                let a = ui.items[i].2;
-                if a.2 >= 1.0 && a.3 >= 1.0 {
-                    y -= strip;
-                } else if a.3 >= 1.0 {
-                    ch = (ch - strip).max(40);
-                }
-            }
+            let (x, y, cw, ch) = anchored(ui.items[i].1, ui.items[i].2, dx, dy);
             match ui.items[i].0 {
                 Item::Win(h) => place(h, x, y, cw, ch),
                 Item::Frame(f) => ui.frames[f].0 = sr(ui, x, y, cw, ch),
@@ -1026,79 +989,6 @@ fn layout() {
                         SWP_NOZORDER | SWP_NOACTIVATE,
                     );
                     place(sb, ix + iw - SB_W, iy, SB_W, ih);
-                }
-            }
-        }
-        if ui.queue_ui == QueueUi::Strip && strip > 0 {
-            let y0 = STATUS_Y + dy - strip;
-            let sheet_w = w - 48;
-            if let Some(&btn) = ui.ctl.get(&B_Q_TOGGLE) {
-                place(btn, 24, y0 + 2, 110, 22);
-            }
-            if strip < STRIP_H {
-                for i in 0..ui.items.len() {
-                    if ui.items[i].1 .1 < 900 {
-                        continue;
-                    }
-                    if let Item::Boxed { frame, .. } = &ui.items[i].0 {
-                        ui.frames[*frame].0 = RECT {
-                            left: 0,
-                            top: 0,
-                            right: 0,
-                            bottom: 0,
-                        };
-                    }
-                }
-            } else if strip >= STRIP_H {
-                // Find the queue boxed item and place it, then the buttons.
-                for i in 0..ui.items.len() {
-                    if ui.items[i].1 .1 < 900 {
-                        continue;
-                    }
-                    let (x, y, cw, ch) = match &ui.items[i].0 {
-                        Item::Boxed { .. } => (24, y0 + 26, sheet_w, 82),
-                        Item::Win(h) => {
-                            let id = ui.ctl.iter().find(|(_, v)| v.0 == h.0).map(|(k, _)| *k);
-                            match id {
-                                Some(B_Q_UP) => (24, y0 + 112, 90, 24),
-                                Some(B_Q_DOWN) => (120, y0 + 112, 100, 24),
-                                Some(B_Q_REMOVE) => (226, y0 + 112, 90, 24),
-                                Some(B_Q_CLEAR) => (322, y0 + 112, 80, 24),
-                                _ => continue,
-                            }
-                        }
-                        _ => continue,
-                    };
-                    match ui.items[i].0 {
-                        Item::Win(h) => place(h, x, y, cw, ch),
-                        Item::Boxed {
-                            clip,
-                            ctl,
-                            sb,
-                            frame,
-                            header,
-                            pad,
-                        } => {
-                            ui.frames[frame].0 = sr(ui, x, y, cw, ch);
-                            let (ix, iy, iw, ih) = (x + 1, y + 1, cw - 2, ch - 2);
-                            let hh = if header.is_some() { 20 } else { 0 };
-                            if let Some(l) = header {
-                                ui.labels[l].0 = sr(ui, ix, iy, iw - SB_W, hh);
-                            }
-                            place(clip, ix, iy + hh, iw - SB_W, ih - hh);
-                            let _ = SetWindowPos(
-                                ctl,
-                                None,
-                                scale(pad, d),
-                                scale(pad, d),
-                                scale(iw - SB_W - pad, d) + GetSystemMetrics(SM_CXVSCROLL),
-                                scale(ih - hh - pad, d),
-                                SWP_NOZORDER | SWP_NOACTIVATE,
-                            );
-                            place(sb, ix + iw - SB_W, iy, SB_W, ih);
-                        }
-                        _ => {}
-                    }
                 }
             }
         }
@@ -1186,42 +1076,17 @@ fn build_controls(instance: HINSTANCE) {
             PAGE_ALL,
             (14, 32, 80, 21),
         );
-        if ui.queue_ui == QueueUi::Tab {
-            child(
-                ui,
-                instance,
-                ui.hwnd,
-                bt,
-                "Queue",
-                BS_OWNERDRAW as u32,
-                B_TAB_QUEUE,
-                PAGE_ALL,
-                (94, 32, 68, 21),
-            );
-            child(
-                ui,
-                instance,
-                ui.hwnd,
-                bt,
-                "Options",
-                BS_OWNERDRAW as u32,
-                B_TAB_OPT,
-                PAGE_ALL,
-                (162, 32, 76, 21),
-            );
-        } else {
-            child(
-                ui,
-                instance,
-                ui.hwnd,
-                bt,
-                "Options",
-                BS_OWNERDRAW as u32,
-                B_TAB_OPT,
-                PAGE_ALL,
-                (96, 32, 76, 21),
-            );
-        }
+        child(
+            ui,
+            instance,
+            ui.hwnd,
+            bt,
+            "Options",
+            BS_OWNERDRAW as u32,
+            B_TAB_OPT,
+            PAGE_ALL,
+            (96, 32, 76, 21),
+        );
 
         // Episodes page
         let m = PAGE_MAIN;
@@ -1419,62 +1284,6 @@ fn build_controls(instance: HINSTANCE) {
         ui.anchor = Anchor(1.0, 1.0, 0.0, 0.0);
         button(ui, instance, "Save", B_SAVE, o, 796, 72, 80);
         ui.anchor = FIXED;
-
-        // Queue list + buttons, used by the Queue tab (option B) or the
-        // collapsible strip (option C). Option A (inline) creates none of these,
-        // so the window looks as it did.
-        match ui.queue_ui {
-            QueueUi::Tab => {
-                let q = PAGE_QUEUE;
-                ui.anchor = Anchor(0.0, 1.0, 0.0, 1.0);
-                boxed(
-                    ui,
-                    instance,
-                    l,
-                    LIST,
-                    ID_QUEUE,
-                    q,
-                    Some("Queue"),
-                    (24, 68, 852, 400),
-                );
-                ui.anchor = Anchor(0.0, 0.0, 1.0, 1.0);
-                button(ui, instance, "Move up", B_Q_UP, q, 24, 476, 90);
-                button(ui, instance, "Move down", B_Q_DOWN, q, 120, 476, 100);
-                button(ui, instance, "Remove", B_Q_REMOVE, q, 226, 476, 90);
-                button(ui, instance, "Clear", B_Q_CLEAR, q, 322, 476, 80);
-                ui.anchor = FIXED;
-            }
-            QueueUi::Strip => {
-                // Placed in layout() just above the status line; y=900 keeps
-                // them off the 900x600 design rect until then.
-                ui.anchor = FIXED;
-                button(ui, instance, "Queue", B_Q_TOGGLE, PAGE_MAIN, 24, 900, 110);
-                boxed(
-                    ui,
-                    instance,
-                    l,
-                    LIST,
-                    ID_QUEUE,
-                    PAGE_MAIN,
-                    None,
-                    (24, 926, 730, 64),
-                );
-                button(ui, instance, "Move up", B_Q_UP, PAGE_MAIN, 24, 996, 90);
-                button(
-                    ui,
-                    instance,
-                    "Move down",
-                    B_Q_DOWN,
-                    PAGE_MAIN,
-                    120,
-                    996,
-                    100,
-                );
-                button(ui, instance, "Remove", B_Q_REMOVE, PAGE_MAIN, 226, 996, 90);
-                button(ui, instance, "Clear", B_Q_CLEAR, PAGE_MAIN, 322, 996, 80);
-            }
-            QueueUi::Inline => {}
-        }
     });
     set_page(PAGE_MAIN);
     update_buttons();
@@ -1487,14 +1296,13 @@ fn set_page(page: u8) {
             let show = *p == PAGE_ALL || *p == page;
             let _ = ShowWindow(*h, if show { SW_SHOW } else { SW_HIDE });
         }
-        for id in [B_TAB_MAIN, B_TAB_OPT, B_TAB_QUEUE] {
+        for id in [B_TAB_MAIN, B_TAB_OPT] {
             if let Some(h) = ui.ctl.get(&id) {
                 let _ = InvalidateRect(*h, None, true);
             }
         }
         let _ = InvalidateRect(ui.hwnd, None, true);
     });
-    sync_queue_widgets();
 }
 
 fn selected(ui: &Ui, id: i32) -> Option<usize> {
@@ -1598,72 +1406,6 @@ fn episode_label(show: u32, e: &store::Episode, queue: &Queue) -> String {
     format!("[{tag}] {}", e.title)
 }
 
-fn fill_queue_list() {
-    with(|ui| {
-        let Some(&h) = ui.ctl.get(&ID_QUEUE) else {
-            return;
-        };
-        let keep = selected_indices(h);
-        let sh = ui.shared.lock().unwrap();
-        let items: Vec<String> = sh.queue.jobs().iter().map(|j| j.list_label()).collect();
-        drop(sh);
-        fill_list(
-            h,
-            &items,
-            &keep,
-            "The queue is empty. Select episodes on the Episodes tab and press Download + transcribe.",
-        );
-    });
-}
-
-/// Height (96-DPI px) the strip steals from the main layout, or 0 if hidden.
-fn strip_height(ui: &Ui, pending: usize) -> i32 {
-    if ui.queue_ui != QueueUi::Strip || ui.page != PAGE_MAIN || pending == 0 && !ui.queue_preview {
-        0
-    } else if ui.queue_strip_open {
-        STRIP_H
-    } else {
-        STRIP_HEAD
-    }
-}
-
-fn sync_queue_widgets() {
-    let strip = with(|ui| unsafe {
-        if ui.queue_ui != QueueUi::Strip {
-            return false;
-        }
-        let pending = ui.shared.lock().unwrap().queue.jobs().len();
-        let show_bar = ui.page == PAGE_MAIN && (pending > 0 || ui.queue_preview);
-        let open = show_bar && ui.queue_strip_open;
-        let vis = |id: i32, on: bool| {
-            if let Some(h) = ui.ctl.get(&id) {
-                let _ = ShowWindow(*h, if on { SW_SHOW } else { SW_HIDE });
-            }
-        };
-        vis(B_Q_TOGGLE, show_bar);
-        for id in [ID_QUEUE, B_Q_UP, B_Q_DOWN, B_Q_REMOVE, B_Q_CLEAR] {
-            vis(id, open);
-        }
-        if let Some(&btn) = ui.ctl.get(&B_Q_TOGGLE) {
-            let n = ui.shared.lock().unwrap().queue.pending_count();
-            let label = if ui.queue_strip_open {
-                "Hide queue".to_string()
-            } else if n == 0 {
-                "Queue".to_string()
-            } else {
-                format!("Queue ({n})")
-            };
-            set_text(btn, &label);
-        }
-        ui.queue_ui == QueueUi::Strip
-    })
-    .unwrap_or(false);
-    fill_queue_list();
-    if strip {
-        layout();
-    }
-}
-
 fn apply_queue_preview() {
     with(|ui| unsafe {
         ui.busy = true;
@@ -1699,37 +1441,8 @@ fn apply_queue_preview() {
     });
     PROGRESS.store(350, std::sync::atomic::Ordering::Relaxed);
     *STAGE.lock().unwrap() = "Transcribing".into();
-    // Highlight the running job in the queue list, if that list exists.
-    with(|ui| unsafe {
-        let Some(&h) = ui.ctl.get(&ID_QUEUE) else {
-            return;
-        };
-        let idx = ui
-            .shared
-            .lock()
-            .unwrap()
-            .queue
-            .jobs()
-            .iter()
-            .position(|j| j.status.is_active());
-        if let Some(i) = idx {
-            SendMessageW(h, LB_SETCURSEL, WPARAM(i), LPARAM(0));
-        }
-    });
     show_details();
     update_buttons();
-}
-
-fn selected_queue_job(ui: &Ui) -> Option<JobId> {
-    let h = *ui.ctl.get(&ID_QUEUE)?;
-    let i = selected_hwnd(h)?;
-    ui.shared
-        .lock()
-        .unwrap()
-        .queue
-        .jobs()
-        .get(i)
-        .map(|j| j.id.clone())
 }
 
 fn feed_link(ui: &Ui, sh: &Shared, id: u32) -> String {
@@ -1820,10 +1533,8 @@ fn refresh_lists() {
             }
         }
     });
-    fill_queue_list();
     show_details();
     update_buttons();
-    sync_queue_widgets();
 }
 
 fn show_details() {
@@ -1934,12 +1645,6 @@ fn update_buttons() {
             })
         };
         let pending = sh.queue.pending_count();
-        let can_clear = sh.queue.jobs().iter().any(|j| !j.status.is_active());
-        let qjob = ui.ctl.get(&ID_QUEUE).and_then(|_| {
-            selected_hwnd(ui.ctl[&ID_QUEUE])
-                .and_then(|i| sh.queue.jobs().get(i))
-                .map(|j| j.status.clone())
-        });
         drop(sh);
         let idle = !ui.busy;
         let en = |id: i32, on: bool| {
@@ -1960,11 +1665,6 @@ fn update_buttons() {
         en(B_EXPORT, idle && st == Some(State::Ready));
         en(B_COPYFEED, show.is_some());
         en(B_CANCEL, ui.busy);
-        let queued = matches!(qjob, Some(queue::JobStatus::Queued));
-        en(B_Q_UP, queued);
-        en(B_Q_DOWN, queued);
-        en(B_Q_REMOVE, matches!(qjob, Some(s) if !s.is_active()));
-        en(B_Q_CLEAR, can_clear);
         SetWindowLongPtrW(ui.ctl[&B_TOKEN], GWLP_USERDATA, ui.token_on as isize);
         let ch = wide(match ui.channels {
             store::Channels::Auto => {
@@ -2283,54 +1983,6 @@ fn enqueue_selected_and_run() {
     start_queue();
 }
 
-fn on_queue_command(id: i32) -> bool {
-    match id {
-        B_TAB_QUEUE => {
-            set_page(PAGE_QUEUE);
-            true
-        }
-        B_Q_TOGGLE => {
-            with(|ui| ui.queue_strip_open = !ui.queue_strip_open);
-            sync_queue_widgets();
-            true
-        }
-        B_Q_UP | B_Q_DOWN => {
-            with(|ui| {
-                if let Some(job) = selected_queue_job(ui) {
-                    let mut sh = ui.shared.lock().unwrap();
-                    sh.queue
-                        .move_queued(&job, if id == B_Q_UP { -1 } else { 1 });
-                    sh.save();
-                }
-            });
-            fill_queue_list();
-            update_buttons();
-            true
-        }
-        B_Q_REMOVE => {
-            with(|ui| {
-                if let Some(job) = selected_queue_job(ui) {
-                    let mut sh = ui.shared.lock().unwrap();
-                    sh.queue.remove(&job);
-                    sh.save();
-                }
-            });
-            refresh_lists();
-            true
-        }
-        B_Q_CLEAR => {
-            with(|ui| {
-                let mut sh = ui.shared.lock().unwrap();
-                sh.queue.clear_inactive();
-                sh.save();
-            });
-            refresh_lists();
-            true
-        }
-        _ => false,
-    }
-}
-
 fn on_command(id: i32, code: u32) {
     if code == LBN_SELCHANGE {
         if id == ID_SHOWS {
@@ -2343,9 +1995,6 @@ fn on_command(id: i32, code: u32) {
         with(|ui| ui.pending = None);
         show_details();
         update_buttons();
-        return;
-    }
-    if on_queue_command(id) {
         return;
     }
     let Some((show, guid, hwnd)) = with(|ui| {
@@ -3124,13 +2773,9 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
             SelectObject(dc, o);
             let _ = DeleteObject(pen);
         }
-        B_TAB_MAIN | B_TAB_OPT | B_TAB_QUEUE => {
+        B_TAB_MAIN | B_TAB_OPT => {
             let active = with(|ui| ui.page)
-                .map(|p| {
-                    (id == B_TAB_MAIN && p == PAGE_MAIN)
-                        || (id == B_TAB_OPT && p == PAGE_OPT)
-                        || (id == B_TAB_QUEUE && p == PAGE_QUEUE)
-                })
+                .map(|p| (id == B_TAB_MAIN && p == PAGE_MAIN) || (id == B_TAB_OPT && p == PAGE_OPT))
                 .unwrap_or(id == B_TAB_MAIN);
             // Raised on three sides; the active tab joins the sheet below it.
             let mut t = r;
