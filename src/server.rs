@@ -459,6 +459,7 @@ mod tests {
             },
             cleaned_bytes: 10,
             served: 0,
+            seen: false,
         };
         fs::create_dir_all(paths.show_dir(id)).unwrap();
         fs::write(paths.cleaned(id, &ep), b"0123456789").unwrap();
