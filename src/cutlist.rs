@@ -9,6 +9,12 @@
 //! Blank lines, lines starting with `#`, and Markdown code fences are ignored.
 //! Prose before the list is skipped and the list ends at the first non-range
 //! line after it, so notes an AI adds around the ranges are ignored.
+//!
+//! Every reply must start each episode's part with a hash line,
+//! `hash: 1a2b3c4d5e6f`: the first 12 hex digits of the SHA-256 of the
+//! episode's original download, as given in the prompt. A reply for several
+//! episodes has one hash line per episode, each followed by its ranges or
+//! `NONE` (see `parse_sections`).
 
 use serde::{Deserialize, Serialize};
 
@@ -143,6 +149,73 @@ pub fn parse_reply(reply: &str) -> Result<Vec<Cut>, String> {
         return Err("no ad ranges found (reply NONE if there are no ads)".into());
     }
     Ok(cuts)
+}
+
+/// One episode's part of a reply: the hash it names and its cuts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Section {
+    pub hash: String,
+    pub cuts: Vec<Cut>,
+}
+
+/// The hash on a `hash: <hex>` line, lower-cased, or None if the line is
+/// not one. Markdown decoration (`**hash:**`, backticks, a leading `-`, `#`
+/// or `>`) is allowed. The value must be at least 12 hex digits; only the
+/// first 12 are kept.
+pub fn hash_line(line: &str) -> Option<String> {
+    let t = line
+        .trim()
+        .trim_start_matches(['#', '>', '-', '*', '`', ' ', '\t'])
+        .trim();
+    let rest = t.get(..4).filter(|p| p.eq_ignore_ascii_case("hash")).map(|_| &t[4..])?;
+    let rest = rest.trim_start_matches(['*', '`', ' ']);
+    let rest = rest.strip_prefix([':', '='])?;
+    let v: String = rest
+        .trim()
+        .trim_matches(['*', '`', '"', '\'', '[', ']', '<', '>', ' ', '.'])
+        .to_ascii_lowercase();
+    (v.len() >= crate::store::SHORT_HASH_LEN && v.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| v[..crate::store::SHORT_HASH_LEN].to_string())
+}
+
+/// Split a reply into per-episode sections at its hash lines and parse
+/// each section's ranges with `parse_reply`. Errors when there is no hash
+/// line at all, when ranges come before the first one, when a hash repeats,
+/// or when a section's ranges don't parse.
+pub fn parse_sections(reply: &str) -> Result<Vec<Section>, String> {
+    let mut parts: Vec<(String, String)> = Vec::new();
+    let mut before = String::new();
+    for line in reply.lines() {
+        if let Some(h) = hash_line(line) {
+            if parts.iter().any(|(p, _)| *p == h) {
+                return Err(format!("hash {h} appears twice in the reply"));
+            }
+            parts.push((h, String::new()));
+        } else {
+            let body = match parts.last_mut() {
+                Some((_, b)) => b,
+                None => &mut before,
+            };
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if parts.is_empty() {
+        return Err(
+            "the reply has no hash line. It must start with the `hash: ...` line from the prompt."
+                .into(),
+        );
+    }
+    if parse_reply(&before).is_ok_and(|c| !c.is_empty()) {
+        return Err("the reply has ad ranges before its first hash line".into());
+    }
+    parts
+        .into_iter()
+        .map(|(hash, body)| {
+            let cuts = parse_reply(&body).map_err(|e| format!("hash {hash}: {e}"))?;
+            Ok(Section { hash, cuts })
+        })
+        .collect()
 }
 
 /// Check cuts against the episode duration. Returns them sorted.
@@ -355,6 +428,67 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v[0].end, 300.0);
+    }
+
+    #[test]
+    fn hash_lines() {
+        let h = Some("1a2b3c4d5e6f".to_string());
+        assert_eq!(hash_line("hash: 1a2b3c4d5e6f"), h);
+        assert_eq!(hash_line("  HASH:1A2B3C4D5E6F  "), h);
+        assert_eq!(hash_line("**hash:** `1a2b3c4d5e6f`"), h);
+        assert_eq!(hash_line("- hash = 1a2b3c4d5e6f."), h);
+        assert_eq!(hash_line("# Hash: 1a2b3c4d5e6f0011"), h);
+        assert_eq!(hash_line("hash: 1a2b3c4d5e6"), None); // too short
+        assert_eq!(hash_line("hash: 1a2b3c4d5e6g"), None); // not hex
+        assert_eq!(hash_line("hash 1a2b3c4d5e6f"), None);
+        assert_eq!(hash_line("hashtag: 1a2b3c4d5e6f"), None);
+        assert_eq!(hash_line("00:00:01.000-00:00:02.000"), None);
+        assert_eq!(hash_line(""), None);
+    }
+
+    #[test]
+    fn sections_single() {
+        let s = parse_sections("Sure!\nhash: aaaaaaaaaaaa\n00:00:01.000-00:00:02.000\n").unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].hash, "aaaaaaaaaaaa");
+        assert_eq!(s[0].cuts, vec![Cut { start: 1.0, end: 2.0 }]);
+        let s = parse_sections("```\nhash: aaaaaaaaaaaa\nNONE\n```").unwrap();
+        assert!(s[0].cuts.is_empty());
+        // Missing hash line.
+        let e = parse_sections("00:00:01.000-00:00:02.000").unwrap_err();
+        assert!(e.contains("no hash line"), "{e}");
+        // Ranges before the hash.
+        let e = parse_sections("00:00:01.000-00:00:02.000\nhash: aaaaaaaaaaaa\nNONE").unwrap_err();
+        assert!(e.contains("before its first hash"), "{e}");
+        // A hash with nothing under it.
+        let e = parse_sections("hash: aaaaaaaaaaaa\n").unwrap_err();
+        assert!(e.starts_with("hash aaaaaaaaaaaa: no ad ranges"), "{e}");
+    }
+
+    #[test]
+    fn sections_multi() {
+        let reply = "Here you go:\n\
+            hash: aaaaaaaaaaaa\n\
+            00:00:00.000-00:00:30.000\n\
+            00:10:00.000-00:11:00.000\n\
+            \n\
+            **hash:** bbbbbbbbbbbb\n\
+            NONE\n\
+            hash: cccccccccccc\n\
+            - 00:01:00.000-00:02:00.000\n\
+            Let me know if you need anything else.\n";
+        let s = parse_sections(reply).unwrap();
+        assert_eq!(
+            s.iter().map(|x| x.hash.as_str()).collect::<Vec<_>>(),
+            ["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"]
+        );
+        assert_eq!(s[0].cuts.len(), 2);
+        assert!(s[1].cuts.is_empty());
+        assert_eq!(s[2].cuts, vec![Cut { start: 60.0, end: 120.0 }]);
+        let e = parse_sections("hash: aaaaaaaaaaaa\nNONE\nhash: AAAAAAAAAAAA\nNONE").unwrap_err();
+        assert!(e.contains("twice"), "{e}");
+        let e = parse_sections("hash: aaaaaaaaaaaa\nNONE\nhash: bbbbbbbbbbbb\n00:00:05-00:00:01").unwrap_err();
+        assert!(e.starts_with("hash bbbbbbbbbbbb: line 1"), "{e}");
     }
 
     #[test]
