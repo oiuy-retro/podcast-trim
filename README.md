@@ -21,12 +21,14 @@ A built copy is [`Podcast.Trim.exe`](https://github.com/oiuy-retro/podcast-trim/
 
 When you add a show, only its newest episode is listed as `[NEW ]`. Every older episode that hasn't been downloaded is listed as `[OLD ]` in dimmer text, because you have usually heard those already in another app. Episodes that turn up later with **Check for new** are always NEW. How many of a new show's newest episodes count as NEW is **NEW on add** in Options (`[episodes] new-on-add` in `configuration.conf`, default 1, 0 lists them all as OLD). OLD episodes can still be downloaded and trimmed like any other.
 
+Episodes your podcast app has already downloaded (SENT) count as seen too. They keep their `[SENT ]` tag and are drawn in the same dimmer text. Mark as unseen on a SENT episode shows it at full brightness again.
+
 Right-click an episode for:
 
 - **Mark as seen** and **Mark as unseen**: the selected episode (every selected episode when several are selected).
 - **Mark older as seen** and **Mark older as unseen**: every episode below the one you clicked, that is, older than it.
 
-Libraries from version 0.1.1 and earlier have no seen marks. The first time 0.1.2 starts, it applies the same rule once to every show already in the list: the newest episode of each (or **NEW on add** of them) stays NEW and the older not-downloaded ones become OLD. Before that it copies `library.json` to `library-before-0.1.2.json` in the same folder. Nothing else in the library changes, and the status line says how many episodes were marked. To undo it for a show, right-click its newest episode and pick **Mark older as unseen**.
+Libraries from version 0.1.1 and earlier have no seen marks. The first time 0.1.2 starts, it applies the same rule once to every show already in the list: the newest episode of each (or **NEW on add** of them) stays NEW and the older not-downloaded ones become OLD. Before that it copies `library.json` to `library-before-0.1.2.json` in the same folder. Episodes that were already SENT are marked seen at the same time. Nothing else in the library changes, and the status line says how many episodes were marked. To undo it for a show, right-click its newest episode and pick **Mark older as unseen**.
 
 ### Bulk AI prompt
 

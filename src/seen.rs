@@ -6,6 +6,12 @@
 //! Episodes that appear later, when the feed is checked again, are NEW.
 //! Shows added before this rule existed get it applied once, the next time
 //! the library loads. Only the `seen` flag changes; nothing else is touched.
+//!
+//! An episode that has been sent (its cleaned file was fetched in full by
+//! the podcast app, state `Delivered`) also counts as seen: it is marked
+//! seen when it is sent, and libraries from before this rule get it once.
+//! It keeps its SENT tag and is drawn dimmed like OLD. Mark as unseen on a
+//! SENT episode draws it at full brightness again.
 
 use crate::store::{Episode, Library, Show, State};
 
@@ -16,7 +22,9 @@ pub enum Mark {
     New,
     /// Not downloaded, but marked as already seen elsewhere.
     Old,
-    /// Downloaded or further along; the seen flag does not matter.
+    /// Sent to the podcast app and seen (the usual case for a sent episode).
+    Sent,
+    /// Downloaded or further along and not sent, or sent and marked unseen.
     Other,
 }
 
@@ -24,8 +32,32 @@ pub fn mark(ep: &Episode) -> Mark {
     match (ep.state, ep.seen) {
         (State::New, false) => Mark::New,
         (State::New, true) => Mark::Old,
+        (State::Delivered, true) => Mark::Sent,
         _ => Mark::Other,
     }
+}
+
+/// Drawn with the faded look: OLD, and sent episodes that count as seen.
+pub fn dimmed(ep: &Episode) -> bool {
+    matches!(mark(ep), Mark::Old | Mark::Sent)
+}
+
+/// One-time upgrade: every episode already sent counts as seen. Runs once
+/// per library, so a sent episode later marked unseen stays unseen.
+/// Returns how many episodes were marked.
+pub fn migrate_sent(lib: &mut Library) -> usize {
+    if lib.sent_seen_done {
+        return 0;
+    }
+    lib.sent_seen_done = true;
+    let mut n = 0;
+    for e in lib.shows.iter_mut().flat_map(|s| s.episodes.iter_mut()) {
+        if e.state == State::Delivered && !e.seen {
+            e.seen = true;
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Keep the newest `keep_new` episodes as they are and mark every older
@@ -189,6 +221,32 @@ mod tests {
         s.episodes[0].seen = false;
         assert_eq!(migrate(&mut lib, 1), (0, 0));
         assert_eq!(mark(&lib.show(id).unwrap().episodes[0]), Mark::New);
+    }
+
+    #[test]
+    fn sent_episodes_are_seen_and_dimmed() {
+        // A 0.1.1 library with one ready and one sent episode.
+        let old = r#"{"next_id":2,"shows":[{"id":1,"title":"S","feed_url":"u",
+            "token":"t","episodes":[
+            {"guid":"a","title":"A","pub_date":"d","source_url":"x","state":"Ready"},
+            {"guid":"b","title":"B","pub_date":"d","source_url":"y","state":"Delivered","served":1}]}]}"#;
+        let mut lib: Library = serde_json::from_str(old).unwrap();
+        assert!(!lib.sent_seen_done);
+        assert_eq!(marks(&lib.shows[0]), [Mark::Other, Mark::Other]);
+        assert_eq!(migrate_sent(&mut lib), 1);
+        assert!(lib.sent_seen_done);
+        assert_eq!(marks(&lib.shows[0]), [Mark::Other, Mark::Sent]);
+        assert!(!dimmed(&lib.shows[0].episodes[0]));
+        assert!(dimmed(&lib.shows[0].episodes[1]));
+        // Marked unseen by hand: full brightness, and a later load keeps it.
+        set(&mut lib.shows[0], &["b".into()], false);
+        assert!(!dimmed(&lib.shows[0].episodes[1]));
+        let text = serde_json::to_string(&lib).unwrap();
+        let mut back: Library = serde_json::from_str(&text).unwrap();
+        assert_eq!(migrate_sent(&mut back), 0);
+        assert_eq!(marks(&back.shows[0]), [Mark::Other, Mark::Other]);
+        // The NEW rule does not touch sent episodes.
+        assert_eq!(migrate(&mut back, 0), (0, 0));
     }
 
     #[test]

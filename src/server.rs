@@ -501,6 +501,7 @@ mod tests {
             let sh = shared.lock().unwrap();
             let e = &sh.lib.show(id).unwrap().episodes[0];
             assert_eq!(e.state, State::Delivered);
+            assert!(e.seen);
             assert!(!sh.paths.cleaned(id, e).exists());
             assert_eq!(e.record.sha256, "h");
         }

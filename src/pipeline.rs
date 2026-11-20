@@ -320,6 +320,8 @@ pub fn mark_delivered(paths: &Paths, show: u32, ep: &mut Episode) {
     let _ = fs::remove_file(paths.cleaned(show, ep));
     ep.served += 1;
     ep.state = State::Delivered;
+    // Sent to the podcast app: it counts as seen.
+    ep.seen = true;
 }
 
 /// Download the original again, check it is byte-for-byte the same file,
@@ -510,6 +512,7 @@ mod tests {
 
         mark_delivered(&paths, 1, &mut ep);
         assert_eq!(ep.state, State::Delivered);
+        assert!(ep.seen);
         assert!(!paths.cleaned(1, &ep).exists());
 
         // Regenerate: no whisper call, same ffmpeg args.
