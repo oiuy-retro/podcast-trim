@@ -30,6 +30,18 @@ Right-click an episode for:
 
 Libraries from version 0.1.1 and earlier have no seen marks. The first time 0.1.2 starts, it applies the same rule once to every show already in the list: the newest episode of each (or **NEW on add** of them) stays NEW and the older not-downloaded ones become OLD. Before that it copies `library.json` to `library-before-0.1.2.json` in the same folder. Episodes that were already SENT are marked seen at the same time. Nothing else in the library changes, and the status line says how many episodes were marked. To undo it for a show, right-click its newest episode and pick **Mark older as unseen**.
 
+### Queueing NEW episodes
+
+Three ways put NEW episodes into the download + transcribe queue without picking them one by one:
+
+- The small arrow next to **Check for new** opens a menu with **Check for new** and **Check for new + queue NEW**. The second checks every show and then queues every NEW episode from all shows.
+- Right-click a show for **Queue NEW in this show** and **Check for new + queue NEW**.
+- While NEW episodes are waiting, the Episode list header shows **Queue N NEW** on its right. Click it to queue all of them, from every show. It is blank when there is nothing to queue.
+
+To queue NEW episodes after every Check for new, tick **Queue NEW after Check for new** in Options (`[episodes] queue-after-refresh = on` in `configuration.conf`, off by default).
+
+Only NEW episodes are queued: OLD and SENT episodes, episodes already downloaded, transcribed or further along, and episodes already queued or running are left out. A failed or cancelled job counts as waiting again. The queue starts by itself once anything is added.
+
 ### Bulk AI prompt
 
 **Bulk prompt...** opens a list of every transcribed episode that is waiting for cuts, from all shows. Tick up to three (**Bulk prompt size** in Options, `[prompt] bulk-size` in `configuration.conf`, 1 to 20) and press **Copy prompt**. The prompt holds every ticked episode's transcript, each under its own `hash:` header line. Paste it into your AI, paste the AI's whole reply into the reply box, and press **Check cuts**: each episode's ranges are matched to it by hash and checked against its own length, and Details lists them. **Approve and cut** then cuts them one after another. Keep the number small; AIs get less careful with very long prompts.
@@ -137,6 +149,7 @@ export = E:\Podcasts
 
 [episodes]
 new-on-add = 1
+queue-after-refresh = off
 
 [prompt]
 bulk-size = 3
@@ -148,7 +161,7 @@ bulk-size = 3
 - `whisper-model = auto` lists every `ggml-*.bin` found the `auto` way in Options. A file path uses that model only.
 - `[folders]` holds the folder each folder picker last used. The app rewrites only that line, so your comments and other edits stay. A remembered folder that no longer exists (for example an unplugged drive) opens at its nearest parent that still exists.
 - `[window]` holds the window's position, size and whether it was maximized (`x`, `y`, `width`, `height` in screen pixels, `maximized = yes` or `no`). The app writes it when it closes, after reading the file again so edits made while it was open stay. Delete the section to open centred at the default size. A saved position that is off every screen (for example on a monitor that is no longer connected) is moved back onto the nearest one.
-- `[episodes] new-on-add` is how many of a newly added show's newest episodes are listed as NEW (default 1). `[prompt] bulk-size` is the most episodes one bulk AI prompt holds (default 3, 1 to 20). A missing or invalid value means the default. Both can also be set in Options.
+- `[episodes] new-on-add` is how many of a newly added show's newest episodes are listed as NEW (default 1). `[prompt] bulk-size` is the most episodes one bulk AI prompt holds (default 3, 1 to 20). `[episodes] queue-after-refresh = on` queues every NEW episode after each Check for new (default `off`; `on`, `yes`, `true` and `1` mean on). A missing or invalid value means the default. All three can also be set in Options.
 - If the folder `Podcast Trim.exe` is in can't be written to (for example under Program Files), the file is read from there and changes are saved to `%AppData%\Podcast Trim\configuration.conf` instead.
 - Unknown lines and sections are ignored.
 

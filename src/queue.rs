@@ -185,6 +185,52 @@ impl Queue {
         (added, skipped)
     }
 
+    /// Queue every NEW episode in the library: not downloaded and not seen
+    /// (so not OLD, not SENT, not transcribed), in list order, newest first
+    /// within each show. Episodes already queued or running are skipped.
+    /// Returns (added, skipped).
+    pub fn add_new(&mut self, lib: &store::Library, only_show: Option<u32>) -> (usize, usize) {
+        let items: Vec<_> = lib
+            .shows
+            .iter()
+            .filter(|s| only_show.is_none_or(|id| id == s.id))
+            .flat_map(|s| {
+                let show_title = if s.title.is_empty() { &s.feed_url } else { &s.title };
+                s.episodes
+                    .iter()
+                    .filter(|e| crate::seen::mark(e) == crate::seen::Mark::New)
+                    .map(move |e| {
+                        (
+                            JobId {
+                                show: s.id,
+                                guid: e.guid.clone(),
+                            },
+                            e.title.clone(),
+                            show_title.clone(),
+                            e.state,
+                        )
+                    })
+            })
+            .collect();
+        self.add_many(items)
+    }
+
+    /// How many episodes `add_new` would add right now.
+    pub fn new_waiting(&self, lib: &store::Library) -> usize {
+        lib.shows
+            .iter()
+            .flat_map(|s| s.episodes.iter().map(move |e| (s.id, e)))
+            .filter(|(_, e)| crate::seen::mark(e) == crate::seen::Mark::New)
+            .filter(|(show, e)| {
+                self.get(&JobId {
+                    show: *show,
+                    guid: e.guid.clone(),
+                })
+                .is_none_or(|j| matches!(j.status, JobStatus::Failed(_) | JobStatus::Cancelled))
+            })
+            .count()
+    }
+
     /// Remove a job that is not currently running. Returns whether it was removed.
     pub fn remove(&mut self, id: &JobId) -> bool {
         match self.jobs.iter().position(|j| j.id == *id) {
@@ -582,5 +628,82 @@ mod tests {
         assert_eq!(JobStatus::Done.list_tag(), None);
         assert!(Queue::can_enqueue(State::New));
         assert!(!Queue::can_enqueue(State::Ready));
+    }
+
+    #[test]
+    fn add_new_skips_old_sent_transcribed_and_queued() {
+        let mut lib = store::Library::default();
+        let a = lib.add_show("A".into(), "ua".into());
+        let b = lib.add_show(String::new(), "ub".into());
+        let mk = |g: &str, state: State, seen: bool| store::Episode {
+            guid: g.into(),
+            title: g.to_uppercase(),
+            pub_date: String::new(),
+            source_url: String::new(),
+            state,
+            record: Default::default(),
+            cleaned_bytes: 0,
+            served: 0,
+            seen,
+        };
+        lib.show_mut(a).unwrap().episodes = vec![
+            mk("new1", State::New, false),
+            mk("trans", State::Transcribed, false),
+            mk("sent", State::Delivered, true),
+            mk("old", State::New, true),
+            mk("new2", State::New, false),
+        ];
+        lib.show_mut(b).unwrap().episodes = vec![mk("b1", State::New, false), mk("b2", State::New, true)];
+        let mut q = Queue::default();
+        q.add(id(a, "new2"), "NEW2".into(), "A".into(), State::New).unwrap();
+        assert_eq!(q.new_waiting(&lib), 2);
+        // Only this show.
+        assert_eq!(q.add_new(&lib, Some(b)), (1, 0));
+        assert_eq!(q.jobs()[1].show_title, "ub");
+        // Every show: new2 is already queued, b1 was just queued.
+        assert_eq!(q.add_new(&lib, None), (1, 2));
+        let ids: Vec<&str> = q.jobs().iter().map(|j| j.id.guid.as_str()).collect();
+        assert_eq!(ids, ["new2", "b1", "new1"]);
+        assert_eq!(q.new_waiting(&lib), 0);
+        assert_eq!(q.add_new(&lib, None), (0, 3));
+    }
+
+    #[test]
+    fn add_new_requeues_failed_and_skips_running_and_downloaded() {
+        let mut lib = store::Library::default();
+        let a = lib.add_show("A".into(), "u".into());
+        let mk = |g: &str, state: State| store::Episode {
+            guid: g.into(),
+            title: g.into(),
+            pub_date: String::new(),
+            source_url: String::new(),
+            state,
+            record: Default::default(),
+            cleaned_bytes: 0,
+            served: 0,
+            seen: false,
+        };
+        lib.show_mut(a).unwrap().episodes = vec![
+            mk("run", State::New),
+            mk("fail", State::New),
+            mk("cancel", State::New),
+            mk("dl", State::Downloaded),
+            mk("ready", State::Ready),
+        ];
+        let mut q = Queue::default();
+        for g in ["run", "fail", "cancel"] {
+            q.add(id(a, g), g.into(), "A".into(), State::New).unwrap();
+        }
+        assert_eq!(q.begin_next().unwrap().id.guid, "run");
+        q.set_status(&id(a, "fail"), JobStatus::Failed("x".into()));
+        q.set_status(&id(a, "cancel"), JobStatus::Cancelled);
+        // Failed and cancelled count as waiting again; running, downloaded
+        // (not NEW) and ready do not.
+        assert_eq!(q.new_waiting(&lib), 2);
+        assert_eq!(q.add_new(&lib, None), (2, 1));
+        assert_eq!(q.new_waiting(&lib), 0);
+        assert_eq!(q.queued_count(), 2);
+        // A show id that does not exist adds nothing.
+        assert_eq!(q.add_new(&lib, Some(99)), (0, 0));
     }
 }

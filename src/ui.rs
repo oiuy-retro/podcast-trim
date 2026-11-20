@@ -92,6 +92,18 @@ const OPT_BASE: i32 = 300;
 const B_CHANNELS: i32 = 213;
 const B_MODEL: i32 = 214;
 const B_BULK: i32 = 219;
+/// The small arrow beside Check for new; opens `REFRESH_MENU`.
+const B_REFRESH_MORE: i32 = 220;
+/// Options check box for `[episodes] queue-after-refresh`.
+const B_AUTOQ: i32 = 221;
+/// "Queue N NEW" in the Episode header; blank while nothing NEW is waiting.
+const B_QNEW: i32 = 222;
+
+const REFRESH_MENU: [&str; 2] = ["Check for new", "Check for new + queue NEW"];
+/// Right-click on the show list.
+const SHOW_MENU: [&str; 2] = ["Queue NEW in this show", "Check for new + queue NEW"];
+/// Width of the two menus above, wide enough for "Check for new + queue NEW".
+const QUEUE_MENU_W: i32 = 190;
 /// Options rows for the NEW rule and the bulk prompt size (configuration.conf).
 const OPT_NEW_ON_ADD: i32 = 320;
 const OPT_BULK_SIZE: i32 = 321;
@@ -134,6 +146,8 @@ struct Ui {
     /// Load in-progress jobs as-is and draw a fake progress state (screenshots).
     queue_preview: bool,
     token_on: bool,
+    /// Options check box state for `[episodes] queue-after-refresh`.
+    autoq_on: bool,
     channels: store::Channels,
     models: Vec<String>,
     model: String,
@@ -466,6 +480,7 @@ pub fn run() -> i32 {
     let upgrade_note = upgrade_seen(&mut lib, &paths, conf.new_on_add());
     let models = tools::model_names(&conf, &tools::exe_dir());
     let saved = WinState::from_conf(&conf);
+    let autoq_on = conf.queue_after_refresh();
     let queue_preview = match std::env::var("PODCAST_TRIM_QUEUE_PREVIEW") {
         Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true"),
         Err(_) => false,
@@ -577,6 +592,7 @@ pub fn run() -> i32 {
             page: PAGE_MAIN,
             queue_preview,
             token_on,
+            autoq_on,
             channels,
             models,
             model,
@@ -1165,7 +1181,8 @@ fn build_controls(instance: HINSTANCE) {
         field(ui, instance, EDIT, ID_URL, m, (24, 392, 264, 22));
         ui.anchor = Anchor(0.0, 0.0, 1.0, 1.0);
         button(ui, instance, "Add show", B_ADD, m, 24, 422, 90);
-        button(ui, instance, "Check for new", B_REFRESH, m, 120, 422, 110);
+        button(ui, instance, "Check for new", B_REFRESH, m, 120, 422, 92);
+        child(ui, instance, ui.hwnd, w!("BUTTON"), "", BTN, B_REFRESH_MORE, m, (212, 422, 18, 24));
 
         ui.anchor = Anchor(0.3, 0.65, 0.0, 1.0);
         boxed(
@@ -1178,6 +1195,9 @@ fn build_controls(instance: HINSTANCE) {
             Some("Episode"),
             (300, 68, 296, 296),
         );
+        // Inside the Episode header, right-aligned; blank when nothing is NEW.
+        ui.anchor = Anchor(0.65, 0.65, 0.0, 0.0);
+        child(ui, instance, ui.hwnd, w!("BUTTON"), "", BTN, B_QNEW, m, (470, 71, 108, 16));
         ui.anchor = Anchor(0.3, 0.3, 1.0, 1.0);
         button(
             ui,
@@ -1360,6 +1380,7 @@ fn build_controls(instance: HINSTANCE) {
             let h = field(ui, instance, EDIT, id, o, (816, y, 60, 22));
             set_text(h, &v.to_string());
         }
+        child(ui, instance, ui.hwnd, w!("BUTTON"), "Queue NEW after Check for new", BTN, B_AUTOQ, o, (668, 170, 208, 20));
         ui.anchor = FIXED;
     });
     set_page(PAGE_MAIN);
@@ -1653,6 +1674,15 @@ fn refresh_lists() {
         };
         fill_list(ui.ctl[&ID_EPS], &eps, &keep_ep, none);
         set_dimmed(ui.ctl[&ID_EPS], &dim);
+        if let Some(h) = ui.ctl.get(&B_QNEW) {
+            let n = sh.queue.new_waiting(&sh.lib);
+            let t = if n == 0 { String::new() } else { format!("Queue {n} NEW") };
+            set_text(*h, &t);
+            unsafe {
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(*h, n > 0 && !ui.queue_preview);
+                let _ = InvalidateRect(*h, None, true);
+            }
+        }
         let link = show.map(|s| feed_link(ui, &sh, s.id)).unwrap_or_default();
         set_text(ui.ctl[&ID_FEED], &link);
         if !ui.busy {
@@ -1791,6 +1821,11 @@ fn update_buttons() {
         };
         en(B_ADD, idle);
         en(B_REFRESH, idle && !ui.show_ids.is_empty());
+        en(B_REFRESH_MORE, idle && !ui.show_ids.is_empty());
+        if let Some(h) = ui.ctl.get(&B_AUTOQ) {
+            SetWindowLongPtrW(*h, GWLP_USERDATA, ui.autoq_on as isize);
+            let _ = InvalidateRect(*h, None, false);
+        }
         en(B_PROCESS, selected_eligible || (idle && pending > 0));
         en(B_PROMPT, st == Some(State::Transcribed));
         en(B_BULK, any_transcribed);
@@ -2198,6 +2233,103 @@ fn start_queue() {
     });
 }
 
+/// Check every show for new episodes. With `then_queue`, or with
+/// `[episodes] queue-after-refresh` on, every NEW episode is queued after.
+fn check_for_new(then_queue: bool) {
+    if with(|ui| ui.busy).unwrap_or(true) {
+        return;
+    }
+    let then_queue = then_queue || with(|ui| ui.shared.lock().unwrap().conf.queue_after_refresh()).unwrap_or(false);
+            const STAGE: &str = "Checking every show for new episodes";
+            background(STAGE, move |shared| {
+                let targets: Vec<refresh::Target> = shared
+                    .lock()
+                    .unwrap()
+                    .lib
+                    .shows
+                    .iter()
+                    .map(|s| {
+                        let name = if s.title.trim().is_empty() {
+                            &s.feed_url
+                        } else {
+                            &s.title
+                        };
+                        (s.id, name.clone(), s.feed_url.clone())
+                    })
+                    .collect();
+                let apply = |id: u32, feed: &rss::SourceFeed| {
+                    let mut sh = shared.lock().unwrap();
+                    sh.lib.show_mut(id).map(|s| pipeline::merge_feed(s, feed))
+                };
+                let done = |n: usize, total: usize| set_progress(STAGE, n as f64 / total as f64);
+                let out = refresh::check_all(&targets, 4, &net::get, &apply, &cancelled, &done);
+                let mut msg = refresh::summary(&out, targets.len(), out.len() < targets.len());
+                if then_queue && !cancelled() {
+                    let mut sh = shared.lock().unwrap();
+                    let lib = sh.lib.clone();
+                    let (added, _) = sh.queue.add_new(&lib, None);
+                    let _ = sh.queue.save(&sh.paths.queue());
+                    msg.push_str(&if added == 0 {
+                        " No NEW episodes to queue.".to_string()
+                    } else {
+                        format!(" Queued {}.", store::plural(added, "NEW episode"))
+                    });
+                }
+                Ok(msg)
+            });
+        }
+
+/// Queue every NEW episode (of one show, or of all) and start the queue.
+fn queue_all_new(only: Option<u32>) {
+    let msg = with(|ui| {
+        if ui.queue_preview {
+            return None;
+        }
+        let mut sh = ui.shared.lock().unwrap();
+        let lib = sh.lib.clone();
+        let (added, _) = sh.queue.add_new(&lib, only);
+        sh.save();
+        Some(if added == 0 {
+            "No NEW episodes to queue. OLD, SENT, transcribed and already queued episodes are left out.".to_string()
+        } else {
+            format!("Queued {}.", store::plural(added, "NEW episode"))
+        })
+    })
+    .flatten();
+    if let Some(m) = msg {
+        with(|ui| status(ui, &m));
+        refresh_lists();
+        update_buttons();
+        start_queue();
+    }
+}
+
+/// Right-click on the show list. Returns whether the click was on it.
+unsafe fn show_menu(lp: LPARAM) -> bool {
+    let Some(list) = with(|ui| ui.ctl[&ID_SHOWS]) else {
+        return false;
+    };
+    let pt = windows::Win32::Foundation::POINT {
+        x: (lp.0 & 0xffff) as i16 as i32,
+        y: ((lp.0 >> 16) & 0xffff) as i16 as i32,
+    };
+    let mut lr = RECT::default();
+    let _ = GetWindowRect(list, &mut lr);
+    if !IsWindowVisible(list).as_bool() || pt.x < lr.left || pt.x >= lr.right || pt.y < lr.top || pt.y >= lr.bottom {
+        return false;
+    }
+    let mut c = pt;
+    let _ = windows::Win32::Graphics::Gdi::ScreenToClient(list, &mut c);
+    let hit = SendMessageW(list, LB_ITEMFROMPOINT, WPARAM(0), LPARAM(((c.y as isize & 0xffff) << 16) | (c.x as isize & 0xffff))).0;
+    if (hit >> 16) & 0xffff == 0 {
+        SendMessageW(list, LB_SETCURSEL, WPARAM((hit & 0xffff) as usize), LPARAM(0));
+        refresh_lists();
+        update_buttons();
+    }
+    open_menu_w(pt.x, pt.y, QUEUE_MENU_W, ID_SHOWS, SHOW_MENU.iter().map(|s| s.to_string()).collect());
+    true
+}
+
 fn enqueue_selected_and_run() {
     let msg = with(|ui| {
         let show = selected(ui, ID_SHOWS).and_then(|i| ui.show_ids.get(i).copied());
@@ -2334,37 +2466,7 @@ fn on_command(id: i32, code: u32) {
             });
             with(|ui| set_text(ui.ctl[&ID_URL], ""));
         }
-        B_REFRESH => {
-            const STAGE: &str = "Checking every show for new episodes";
-            background(STAGE, move |shared| {
-                let targets: Vec<refresh::Target> = shared
-                    .lock()
-                    .unwrap()
-                    .lib
-                    .shows
-                    .iter()
-                    .map(|s| {
-                        let name = if s.title.trim().is_empty() {
-                            &s.feed_url
-                        } else {
-                            &s.title
-                        };
-                        (s.id, name.clone(), s.feed_url.clone())
-                    })
-                    .collect();
-                let apply = |id: u32, feed: &rss::SourceFeed| {
-                    let mut sh = shared.lock().unwrap();
-                    sh.lib.show_mut(id).map(|s| pipeline::merge_feed(s, feed))
-                };
-                let done = |n: usize, total: usize| set_progress(STAGE, n as f64 / total as f64);
-                let out = refresh::check_all(&targets, 4, &net::get, &apply, &cancelled, &done);
-                Ok(refresh::summary(
-                    &out,
-                    targets.len(),
-                    out.len() < targets.len(),
-                ))
-            });
-        }
+        B_REFRESH => check_for_new(false),
         B_PROCESS => enqueue_selected_and_run(),
         B_PROMPT => {
             let text = with(|ui| {
@@ -2627,6 +2729,22 @@ fn on_command(id: i32, code: u32) {
             with(|ui| ui.token_on = !ui.token_on);
             update_buttons();
         }
+        B_AUTOQ => {
+            with(|ui| ui.autoq_on = !ui.autoq_on);
+            update_buttons();
+        }
+        B_REFRESH_MORE => unsafe {
+            // Opens upward from Check for new, so the feed link row stays visible.
+            if let Some(h) = with(|ui| ui.ctl[&B_REFRESH]) {
+                let mut r = RECT::default();
+                let _ = GetWindowRect(h, &mut r);
+                let d = DPI.load(std::sync::atomic::Ordering::Relaxed);
+                let items: Vec<String> = REFRESH_MENU.iter().map(|s| s.to_string()).collect();
+                let height = scale(DROP_ROW, d) * items.len() as i32 + 2;
+                open_popup(r.left, r.top - height, scale(QUEUE_MENU_W, d), B_REFRESH_MORE, items, -1);
+            }
+        },
+        B_QNEW => queue_all_new(None),
         B_SAVE => {
             with(|ui| {
                 let v: Vec<String> = (0..OPTION_LABELS.len() as i32)
@@ -2667,6 +2785,7 @@ fn on_command(id: i32, code: u32) {
                             if let Some(n) = bulk {
                                 c.set("prompt", "bulk-size", &n.to_string());
                             }
+                            c.set("episodes", "queue-after-refresh", if ui.autoq_on { "on" } else { "off" });
                         })
                     })
                     .and_then(|_| sh.conf.set_folder("export", &v[6]));
@@ -2817,10 +2936,10 @@ unsafe fn paint(hwnd: HWND) {
             text(dc, s, &mut r, TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         }
         if ui.page == PAGE_OPT {
-            let mut r = sr(ui, 668 + cw - WIN_W, 168, 208, 160);
+            let mut r = sr(ui, 668 + cw - WIN_W, 200, 208, 190);
             text(
                 dc,
-                "NEW on add: how many of a new show's newest episodes are listed as NEW; older ones are listed as OLD. Bulk prompt size: the most episodes in one bulk AI prompt (1 to 20). Both are also in configuration.conf.",
+                "NEW on add: how many of a new show's newest episodes are listed as NEW; older ones are listed as OLD. Bulk prompt size: the most episodes in one bulk AI prompt (1 to 20). Queue NEW after Check for new: NEW episodes go into the queue after each check. All three are also in configuration.conf.",
                 &mut r,
                 DIM,
                 DT_LEFT | windows::Win32::Graphics::Gdi::DT_WORDBREAK,
@@ -2867,8 +2986,13 @@ unsafe fn open_dropdown(btn: HWND, owner: i32, items: Vec<String>, current: &str
 /// The same list used as a right-click menu at screen point (x, y), moved
 /// up or left if it would go off the monitor.
 unsafe fn open_menu(x: i32, y: i32, owner: i32, items: Vec<String>) {
+    open_menu_w(x, y, 170, owner, items);
+}
+
+/// `open_menu` with a width in 96-DPI pixels.
+unsafe fn open_menu_w(x: i32, y: i32, width: i32, owner: i32, items: Vec<String>) {
     let d = DPI.load(std::sync::atomic::Ordering::Relaxed);
-    let (w, h) = (scale(170, d), scale(DROP_ROW, d) * items.len() as i32 + 2);
+    let (w, h) = (scale(width, d), scale(DROP_ROW, d) * items.len() as i32 + 2);
     let (l, t, r, b) = work_area((x, y, 1, 1));
     let x = if x + w > r { (x - w).max(l) } else { x };
     let y = if y + h > b { (y - h).max(t) } else { y };
@@ -3211,7 +3335,25 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
             tr.left += scale(6, d);
             text(dc, &label, &mut tr, if active { TAN } else { TEXT }, flags);
         }
-        B_TOKEN => {
+        B_QNEW => {
+            // A plain tan link on the header bar; nothing when there is no NEW.
+            let hot = pressed && !disabled;
+            let mut tr = r;
+            tr.right -= scale(4, d);
+            text(dc, &label, &mut tr, if hot { rgb(255, 255, 255) } else { TAN }, windows::Win32::Graphics::Gdi::DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+        }
+        B_REFRESH_MORE => {
+            bevel(dc, &r, !pressed);
+            let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2 + 1);
+            let p = CreatePen(PS_SOLID, 1, COLORREF(if disabled { DIM } else { TEXT }));
+            let o = SelectObject(dc, p);
+            for i in 0..3 {
+                line(dc, cx - 2 + i, cy - 1 + i, cx + 3 - i, cy - 1 + i);
+            }
+            SelectObject(dc, o);
+            let _ = DeleteObject(p);
+        }
+        B_TOKEN | B_AUTOQ => {
             let on = GetWindowLongPtrW(dis.hwndItem, GWLP_USERDATA) != 0;
             let s = scale(13, d);
             let bx = RECT {
@@ -3661,11 +3803,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_CONTEXTMENU => {
+            if show_menu(lp) {
+                return LRESULT(0);
+            }
             episode_menu(lp);
             LRESULT(0)
         }
         WM_MODEL_PICK if lp.0 as i32 == ID_EPS => {
             seen_menu_pick(wp.0);
+            LRESULT(0)
+        }
+        WM_MODEL_PICK if lp.0 as i32 == B_REFRESH_MORE => {
+            match wp.0 {
+                0 => check_for_new(false),
+                1 => check_for_new(true),
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_MODEL_PICK if lp.0 as i32 == ID_SHOWS => {
+            let show = with(|ui| selected(ui, ID_SHOWS).and_then(|i| ui.show_ids.get(i).copied())).flatten();
+            match wp.0 {
+                0 if show.is_some() => queue_all_new(show),
+                1 => check_for_new(true),
+                _ => {}
+            }
             LRESULT(0)
         }
         WM_MODEL_PICK => {
