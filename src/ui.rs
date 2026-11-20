@@ -2288,17 +2288,20 @@ fn queue_all_new(only: Option<u32>) {
         let mut sh = ui.shared.lock().unwrap();
         let lib = sh.lib.clone();
         let (added, _) = sh.queue.add_new(&lib, only);
+        let m = match (added, only) {
+            (0, Some(_)) => "No NEW episodes in this show to queue. OLD, SENT, transcribed and already queued episodes are left out.".to_string(),
+            (0, None) => "No NEW episodes to queue. OLD, SENT, transcribed and already queued episodes are left out.".to_string(),
+            _ => format!("Queued {}.", store::plural(added, "NEW episode")),
+        };
+        // Kept in the log so the next list refresh shows it rather than an older line.
+        sh.note(m.clone());
         sh.save();
-        Some(if added == 0 {
-            "No NEW episodes to queue. OLD, SENT, transcribed and already queued episodes are left out.".to_string()
-        } else {
-            format!("Queued {}.", store::plural(added, "NEW episode"))
-        })
+        Some(m)
     })
     .flatten();
     if let Some(m) = msg {
-        with(|ui| status(ui, &m));
         refresh_lists();
+        with(|ui| status(ui, &m));
         update_buttons();
         start_queue();
     }
