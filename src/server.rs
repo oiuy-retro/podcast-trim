@@ -24,6 +24,7 @@ pub struct Shared {
     pub paths: Paths,
     pub coverage: HashMap<String, Coverage>,
     pub log: Vec<String>,
+    pub queue: crate::queue::Queue,
 }
 
 impl Shared {
@@ -35,6 +36,7 @@ impl Shared {
     }
     pub fn save(&self) {
         let _ = save_json(&self.paths.library(), &self.lib);
+        let _ = self.queue.save(&self.paths.queue());
     }
 }
 
@@ -475,6 +477,7 @@ mod tests {
             paths,
             coverage: HashMap::new(),
             log: vec![],
+            queue: Default::default(),
         }));
         let addr = start(shared.clone(), Arc::new(|| {})).unwrap();
 
