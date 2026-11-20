@@ -17,14 +17,45 @@ A built copy is [`Podcast.Trim.exe`](https://github.com/oiuy-retro/podcast-trim/
 
 **Export Opus...** asks for a folder (it starts in the last one used, saved in `configuration.conf`) and copies the trimmed episode there, for use without the feed.
 
+### NEW and OLD episodes
+
+When you add a show, only its newest episode is listed as `[NEW ]`. Every older episode that hasn't been downloaded is listed as `[OLD ]` in dimmer text, because you have usually heard those already in another app. Episodes that turn up later with **Check for new** are always NEW. How many of a new show's newest episodes count as NEW is **NEW on add** in Options (`[episodes] new-on-add` in `configuration.conf`, default 1, 0 lists them all as OLD). OLD episodes can still be downloaded and trimmed like any other.
+
+Episodes your podcast app has already downloaded (SENT) count as seen too. They keep their `[SENT ]` tag and are drawn in the same dimmer text. Mark as unseen on a SENT episode shows it at full brightness again.
+
+Right-click an episode for:
+
+- **Mark as seen** and **Mark as unseen**: the selected episode (every selected episode when several are selected).
+- **Mark older as seen** and **Mark older as unseen**: every episode below the one you clicked, that is, older than it.
+
+Libraries from version 0.1.1 and earlier have no seen marks. The first time 0.1.2 starts, it applies the same rule once to every show already in the list: the newest episode of each (or **NEW on add** of them) stays NEW and the older not-downloaded ones become OLD. Before that it copies `library.json` to `library-before-0.1.2.json` in the same folder. Episodes that were already SENT are marked seen at the same time. Nothing else in the library changes, and the status line says how many episodes were marked. To undo it for a show, right-click its newest episode and pick **Mark older as unseen**.
+
+### Bulk AI prompt
+
+**Bulk prompt...** opens a list of every transcribed episode that is waiting for cuts, from all shows. Tick up to three (**Bulk prompt size** in Options, `[prompt] bulk-size` in `configuration.conf`, 1 to 20) and press **Copy prompt**. The prompt holds every ticked episode's transcript, each under its own `hash:` header line. Paste it into your AI, paste the AI's whole reply into the reply box, and press **Check cuts**: each episode's ranges are matched to it by hash and checked against its own length, and Details lists them. **Approve and cut** then cuts them one after another. Keep the number small; AIs get less careful with very long prompts.
+
 ## AI reply format
 
-One ad per line, start and end separated by a hyphen:
+The reply starts with the episode's audio hash, then one ad per line, start and end separated by a hyphen:
 
 ```
+hash: 1a2b3c4d5e6f
 00:00:00.000-00:00:42.500
 00:23:10.120-00:25:01.900
 ```
+
+The audio hash is the first 12 hex digits of the SHA-256 of the episode's original download, shown in Details. The prompt gives it to the AI. **Check cuts** refuses a reply with no `hash:` line or with a hash that isn't the selected episode's, and names the episode the hash belongs to if it is another one in the library. This keeps cuts meant for one episode from being applied to another. There is no override; if you are sure, edit the hash line in the reply box.
+
+A reply to a bulk prompt has one `hash:` line per episode, each followed by that episode's ranges or `NONE`:
+
+```
+hash: 1a2b3c4d5e6f
+00:00:00.000-00:00:42.500
+hash: 0f9e8d7c6b5a
+NONE
+```
+
+If any hash in it doesn't belong to a transcribed episode, or any episode's ranges don't fit it, the whole reply is refused and nothing is cut. A reply with one hash line pasted while no transcribed episode is selected is matched by its hash the same way.
 
 `MM:SS.mmm` and plain seconds (`12.5-40`) are also accepted, as is a line `NONE` for no ads. Blank lines, lines starting with `#`, and Markdown code fences are ignored. JSON is also accepted:
 
@@ -103,6 +134,12 @@ whisper-model = auto
 
 [folders]
 export = E:\Podcasts
+
+[episodes]
+new-on-add = 1
+
+[prompt]
+bulk-size = 3
 ```
 
 - `auto` looks next to `Podcast Trim.exe`, then in each folder directly inside it, then in a `bin` folder inside each of those, then on PATH. A missing line means `auto`.
@@ -111,6 +148,7 @@ export = E:\Podcasts
 - `whisper-model = auto` lists every `ggml-*.bin` found the `auto` way in Options. A file path uses that model only.
 - `[folders]` holds the folder each folder picker last used. The app rewrites only that line, so your comments and other edits stay. A remembered folder that no longer exists (for example an unplugged drive) opens at its nearest parent that still exists.
 - `[window]` holds the window's position, size and whether it was maximized (`x`, `y`, `width`, `height` in screen pixels, `maximized = yes` or `no`). The app writes it when it closes, after reading the file again so edits made while it was open stay. Delete the section to open centred at the default size. A saved position that is off every screen (for example on a monitor that is no longer connected) is moved back onto the nearest one.
+- `[episodes] new-on-add` is how many of a newly added show's newest episodes are listed as NEW (default 1). `[prompt] bulk-size` is the most episodes one bulk AI prompt holds (default 3, 1 to 20). A missing or invalid value means the default. Both can also be set in Options.
 - If the folder `Podcast Trim.exe` is in can't be written to (for example under Program Files), the file is read from there and changes are saved to `%AppData%\Podcast Trim\configuration.conf` instead.
 - Unknown lines and sections are ignored.
 
