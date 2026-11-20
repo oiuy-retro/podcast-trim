@@ -671,12 +671,13 @@ pub fn run() -> i32 {
 /// `keep_new` episodes of each stay NEW. library.json is copied to
 /// library-before-0.1.2.json first. Returns a message for the status line.
 fn upgrade_seen(lib: &mut Library, paths: &Paths, keep_new: usize) -> Option<String> {
-    if lib.shows.iter().all(|s| s.seen_rule_done) {
+    if lib.shows.iter().all(|s| s.seen_rule_done) && lib.sent_seen_done {
         return None;
     }
     let mut after = lib.clone();
     let (shows, eps) = seen::migrate(&mut after, keep_new);
-    if eps > 0 {
+    let sent = seen::migrate_sent(&mut after);
+    if eps + sent > 0 {
         let backup = paths.root.join("library-before-0.1.2.json");
         if !backup.exists() && std::fs::copy(paths.library(), &backup).is_err() {
             // Without a backup, leave the library as it is this time.
@@ -684,15 +685,24 @@ fn upgrade_seen(lib: &mut Library, paths: &Paths, keep_new: usize) -> Option<Str
         }
     }
     *lib = after;
-    if save_json(&paths.library(), lib).is_err() || eps == 0 {
+    if save_json(&paths.library(), lib).is_err() || eps + sent == 0 {
         return None;
     }
-    Some(format!(
-        "Listed {} in {} as OLD (already seen); only the newest {} of each show stay NEW. Right-click an episode to change this.",
-        store::plural(eps, "older episode"),
-        store::plural(shows, "show"),
-        keep_new
-    ))
+    let mut parts = Vec::new();
+    if eps > 0 {
+        parts.push(format!(
+            "Listed {} in {} as OLD (already seen); only the newest {} of each show stay NEW.",
+            store::plural(eps, "older episode"),
+            store::plural(shows, "show"),
+            keep_new
+        ));
+    }
+    if sent > 0 {
+        let verb = if sent == 1 { "counts" } else { "count" };
+        parts.push(format!("{} now {verb} as seen.", store::plural(sent, "sent episode")));
+    }
+    parts.push("Right-click an episode to change this.".into());
+    Some(parts.join(" "))
 }
 
 /// The window's last restored (not maximized or minimized) screen rect.
@@ -1383,7 +1393,8 @@ fn current(ui: &Ui) -> (Option<u32>, Option<String>) {
     (show, ep)
 }
 
-/// List tag for an episode: OLD for one marked as already seen.
+/// List tag for an episode: OLD for one marked as already seen. A sent
+/// episode keeps SENT whether or not it is seen; only the dimming differs.
 fn episode_tag(e: &store::Episode) -> &'static str {
     match seen::mark(e) {
         seen::Mark::Old => "OLD  ",
@@ -1498,14 +1509,18 @@ fn fill_list(h: HWND, items: &[String], keep: &[usize], empty: &str) {
     }
 }
 
-fn episode_label(show: u32, e: &store::Episode, queue: &Queue) -> String {
-    let tag = queue
+/// The queue's list tag for an episode, if it is in the queue.
+fn queue_tag(show: u32, e: &store::Episode, queue: &Queue) -> Option<&'static str> {
+    queue
         .get(&JobId {
             show,
             guid: e.guid.clone(),
         })
         .and_then(|j| j.status.list_tag())
-        .unwrap_or(episode_tag(e));
+}
+
+fn episode_label(show: u32, e: &store::Episode, queue: &Queue) -> String {
+    let tag = queue_tag(show, e, queue).unwrap_or(episode_tag(e));
     format!("[{tag}] {}", e.title)
 }
 
@@ -1621,8 +1636,15 @@ fn refresh_lists() {
                     .unzip()
             })
             .unwrap_or_default();
-        // Dimmed only while listed as OLD; a queue tag shows at full brightness.
-        let dim: Vec<bool> = eps.iter().map(|l| l.starts_with("[OLD")).collect();
+        // Dimmed while OLD or seen SENT; a queue tag shows at full brightness.
+        let dim: Vec<bool> = show
+            .map(|s| {
+                s.episodes
+                    .iter()
+                    .map(|e| seen::dimmed(e) && queue_tag(s.id, e, &sh.queue).is_none())
+                    .collect()
+            })
+            .unwrap_or_default();
         ui.ep_guids = guids;
         let none = if show.is_some() {
             "This show has no episodes yet."
@@ -1684,8 +1706,10 @@ fn show_details() {
                         }
                         t.push_str(if e.state == State::Ready {
                             "\nIn the feed. It is deleted after one full download."
+                        } else if e.seen {
+                            "\nSent: downloaded once by your podcast app and deleted. It counts as seen; right-click to mark it unseen. Regenerate to put it back in the feed."
                         } else {
-                            "\nDownloaded once and deleted. Regenerate to put it back in the feed."
+                            "\nSent: downloaded once by your podcast app and deleted. Regenerate to put it back in the feed."
                         });
                     }
                 }

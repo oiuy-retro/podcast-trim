@@ -3,6 +3,7 @@
 ## Unreleased
 
 - New shows list only their newest episode as NEW (set with **NEW on add** in Options or `[episodes] new-on-add` in `configuration.conf`). Older episodes are listed as OLD in dimmer text. Episodes found later by Check for new are NEW.
+- SENT episodes count as seen and are drawn dimmed like OLD, keeping their SENT tag. Episodes sent before this version are marked seen once on upgrade.
 - Right-click menu on the episode list: Mark as seen, Mark as unseen, Mark older as seen, Mark older as unseen.
 - Libraries from 0.1.1 get the NEW rule once on first start; `library.json` is copied to `library-before-0.1.2.json` first. Older `library.json` files still load.
 - The AI prompt includes the episode's audio hash and asks the AI to start its reply with `hash: <hash>`. Check cuts refuses replies without it or with another episode's hash.

@@ -144,8 +144,9 @@ pub struct Episode {
     #[serde(default)]
     pub served: u32,
     /// Already seen elsewhere: a `New` episode with this set is listed as
-    /// OLD (dimmed) instead of NEW. Files from before 0.1.2 have no such
-    /// field and read as `false`.
+    /// OLD (dimmed) instead of NEW, and a `Delivered` one keeps its SENT tag
+    /// but is dimmed. Set when an episode is sent. Files from before 0.1.2
+    /// have no such field and read as `false`.
     #[serde(default)]
     pub seen: bool,
 }
@@ -186,6 +187,9 @@ pub struct Show {
 pub struct Library {
     pub next_id: u32,
     pub shows: Vec<Show>,
+    /// Episodes sent before 0.1.2 have been marked seen (once).
+    #[serde(default)]
+    pub sent_seen_done: bool,
 }
 
 impl Library {
