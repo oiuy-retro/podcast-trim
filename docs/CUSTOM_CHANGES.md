@@ -11,3 +11,5 @@
 - Download + transcribe queue: Shift/Ctrl-click several episodes and they are processed one at a time. Pending jobs are saved in `queue.json` next to `library.json`. Cancel stops the current job and the rest of the queue. Already-transcribed episodes and duplicates are skipped; a failure does not stop the jobs after it.
 
 - Queue NEW episodes: the arrow next to Check for new (Check for new + queue NEW), right-click on a show (Queue NEW in this show, Check for new + queue NEW), the Queue N NEW link in the Episode header, and `[episodes] queue-after-refresh` (Options: Queue NEW after Check for new). OLD, SENT, transcribed, queued and running episodes are skipped.
+
+- Show and episode artwork from the source RSS feed (`itunes:image`, RSS 2.0 `<image>`, `media:thumbnail`, image `media:content`) is stored as `image_url` in `library.json` and passed on in each trimmed feed as `<itunes:image>` (and `<image>` for the show). Check for new fills it in for shows and episodes added earlier.

@@ -149,6 +149,10 @@ pub struct Episode {
     /// have no such field and read as `false`.
     #[serde(default)]
     pub seen: bool,
+    /// Episode artwork URL from the source feed, passed on in the cleaned
+    /// feed. Empty (and left out of library.json) when there is none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image_url: String,
 }
 
 impl Episode {
@@ -181,6 +185,9 @@ pub struct Show {
     /// it was added, or once on upgrade for shows added before 0.1.2).
     #[serde(default)]
     pub seen_rule_done: bool,
+    /// Show artwork URL from the source feed, passed on in the cleaned feed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image_url: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -210,6 +217,7 @@ impl Library {
             token: new_token(),
             episodes: Vec::new(),
             seen_rule_done: false,
+            image_url: String::new(),
         });
         id
     }
@@ -400,5 +408,23 @@ mod tests {
         assert_eq!(old.migrate().channels, Channels::Mono);
         let text = serde_json::to_string(&Settings::default()).unwrap();
         assert!(text.contains("\"channels\":\"Auto\"") && !text.contains("\"mono\""));
+    }
+
+    #[test]
+    fn artwork_fields_are_optional() {
+        // library.json from 0.1.1: no image_url anywhere.
+        let old = r#"{"next_id":2,"shows":[{"id":1,"title":"S","feed_url":"u","token":"t",
+            "episodes":[{"guid":"g","title":"E","pub_date":"d","source_url":"x","state":"New"}]}]}"#;
+        let mut lib: Library = serde_json::from_str(old).unwrap();
+        assert_eq!(lib.shows[0].image_url, "");
+        assert_eq!(lib.shows[0].episodes[0].image_url, "");
+        // Empty values stay out of the file, so it looks as before.
+        let text = serde_json::to_string(&lib).unwrap();
+        assert!(!text.contains("image_url"));
+        lib.shows[0].image_url = "http://x/s.jpg".into();
+        lib.shows[0].episodes[0].image_url = "http://x/e.jpg".into();
+        let back: Library = serde_json::from_str(&serde_json::to_string(&lib).unwrap()).unwrap();
+        assert_eq!(back.shows[0].image_url, "http://x/s.jpg");
+        assert_eq!(back.shows[0].episodes[0].image_url, "http://x/e.jpg");
     }
 }

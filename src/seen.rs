@@ -134,6 +134,7 @@ mod tests {
                 cleaned_bytes: 0,
                 served: 0,
                 seen: false,
+                image_url: String::new(),
             });
         }
         id

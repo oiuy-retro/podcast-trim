@@ -85,6 +85,15 @@ Anything else is rejected with the line number of the problem.
 - The server speaks plain HTTP. To reach it from outside your home network, use a private VPN such as Tailscale instead of opening a port on your router.
 - Windows Firewall will ask whether to allow Podcast Trim on the network the first time it starts. Allow it on private networks.
 
+### Artwork
+
+Each show's feed carries the artwork of the source feed, so the podcast app shows the same cover and episode pictures as the original show.
+
+- Show artwork is read from the source feed's `<itunes:image href="...">`, or from its RSS 2.0 `<image><url>` when there is no `itunes:image`. The trimmed feed lists it both ways.
+- Episode artwork is read from each item's `<itunes:image href="...">`, then `<media:thumbnail url="...">`, then an image `<media:content url="...">` (with `medium="image"` or an `image/...` type). The trimmed feed lists it as `<itunes:image>` on the item. Episodes without their own picture use the show's.
+- The pictures stay on the publisher's server; Podcast Trim only passes on their addresses, stored as `image_url` in `library.json`. Your podcast app downloads them from there, so it needs internet access for them even when the feed comes from this PC.
+- Shows added before this version get their artwork the next time **Check for new** runs. Refresh the feed in the podcast app afterwards; AntennaPod may keep showing the old cover until its image cache updates.
+
 ## Audio format
 
 Trimmed episodes are Ogg Opus (`.opus`, encoded with libopus, variable bitrate). With **Opus bitrate** and **Channels** set to Auto (the defaults), both are picked from the original with ffprobe.

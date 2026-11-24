@@ -181,11 +181,13 @@ pub fn feed_xml(shared: &Shared, show_id: u32, host: &str) -> Option<String> {
                 crate::cutlist::format_time(crate::cutlist::removed_seconds(&e.record.cuts)),
                 e.record.cuts.len()
             ),
+            image_url: e.image_url.clone(),
         })
         .collect();
     Some(rss::generate(
         &show.title,
         &format!("{base}/feed/{show_id}.xml{tok}"),
+        &show.image_url,
         &items,
     ))
 }
@@ -460,7 +462,9 @@ mod tests {
             cleaned_bytes: 10,
             served: 0,
             seen: false,
+            image_url: "http://x/e.jpg?a=1&b=2".into(),
         };
+        lib.show_mut(id).unwrap().image_url = "http://x/s.jpg".into();
         fs::create_dir_all(paths.show_dir(id)).unwrap();
         fs::write(paths.cleaned(id, &ep), b"0123456789").unwrap();
         let key = ep.key();
@@ -489,6 +493,10 @@ mod tests {
         let xml = String::from_utf8(body).unwrap();
         let media = format!("/media/{id}/{key}.opus?token={token}");
         assert!(xml.contains(&format!("http://{addr}{}", media.replace('&', "&amp;"))));
+        // Artwork from the source feed is passed on.
+        assert!(xml.contains("<itunes:image href=\"http://x/s.jpg\"/>"));
+        assert!(xml.contains("<image><url>http://x/s.jpg</url>"));
+        assert!(xml.contains("<itunes:image href=\"http://x/e.jpg?a=1&amp;b=2\"/>"));
 
         let (h, body) = get(addr, &media, "Range: bytes=0-4\r\n");
         assert!(h.contains("206") && h.contains("bytes 0-4/10"));
