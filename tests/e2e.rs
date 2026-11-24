@@ -57,6 +57,7 @@ fn episode(guid: &str) -> Episode {
         record: Default::default(),
         cleaned_bytes: 0,
         served: 0,
+        image_url: String::new(),
     }
 }
 
@@ -159,6 +160,7 @@ fn real_tools() {
         record: Default::default(),
         cleaned_bytes: 0,
         served: 0,
+        image_url: String::new(),
     };
     pipeline::download(&env, &s, &paths, 1, &mut ep).unwrap();
     pipeline::transcribe(&env, &s, &paths, 1, &mut ep).unwrap();

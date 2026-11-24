@@ -55,9 +55,17 @@ pub fn merge_feed(show: &mut Show, feed: &rss::SourceFeed) -> usize {
     if show.title.is_empty() || show.title == show.feed_url {
         show.title = feed.title.clone();
     }
+    // Artwork follows the source feed, also for shows and episodes added
+    // before artwork was stored. An image that disappears from the feed is kept.
+    if !feed.image_url.is_empty() {
+        show.image_url = feed.image_url.clone();
+    }
     let mut added = 0;
     for item in feed.items.iter().rev() {
-        if show.episodes.iter().any(|e| e.guid == item.guid) {
+        if let Some(e) = show.episodes.iter_mut().find(|e| e.guid == item.guid) {
+            if !item.image_url.is_empty() {
+                e.image_url = item.image_url.clone();
+            }
             continue;
         }
         show.episodes.insert(
@@ -71,6 +79,7 @@ pub fn merge_feed(show: &mut Show, feed: &rss::SourceFeed) -> usize {
                 record: Default::default(),
                 cleaned_bytes: 0,
                 served: 0,
+                image_url: item.image_url.clone(),
             },
         );
         added += 1;
@@ -402,6 +411,7 @@ mod tests {
             record: Default::default(),
             cleaned_bytes: 0,
             served: 0,
+            image_url: String::new(),
         };
         (
             Fake {
@@ -541,27 +551,67 @@ mod tests {
             feed_url: "u".into(),
             token: "t".into(),
             episodes: vec![],
+            image_url: String::new(),
+        };
+        let item = |guid: &str, title: &str, url: &str| rss::SourceItem {
+            guid: guid.into(),
+            title: title.into(),
+            url: url.into(),
+            pub_date: String::new(),
+            image_url: String::new(),
         };
         let feed = rss::SourceFeed {
             title: "Real".into(),
+            image_url: String::new(),
+            items: vec![item("2", "Two", "a"), item("1", "One", "b")],
+        };
+        assert_eq!(merge_feed(&mut show, &feed), 2);
+        assert_eq!(merge_feed(&mut show, &feed), 0);
+        assert_eq!(show.title, "Real");
+        assert_eq!(show.episodes[0].guid, "2");
+        assert!(show.image_url.is_empty() && show.episodes.iter().all(|e| e.image_url.is_empty()));
+    }
+
+    #[test]
+    fn refresh_backfills_artwork() {
+        // A show and an episode stored before artwork was kept.
+        let old = r#"{"id":1,"title":"Real","feed_url":"u","token":"t","episodes":[
+            {"guid":"1","title":"One","pub_date":"","source_url":"b","state":"Ready",
+             "cleaned_bytes":5,"served":0}]}"#;
+        let mut show: Show = serde_json::from_str(old).unwrap();
+        let mut feed = rss::SourceFeed {
+            title: "Real".into(),
+            image_url: "http://x/show.jpg".into(),
             items: vec![
                 rss::SourceItem {
                     guid: "2".into(),
                     title: "Two".into(),
                     url: "a".into(),
                     pub_date: String::new(),
+                    image_url: "http://x/2.jpg".into(),
                 },
                 rss::SourceItem {
                     guid: "1".into(),
                     title: "One".into(),
                     url: "b".into(),
                     pub_date: String::new(),
+                    image_url: "http://x/1.jpg".into(),
                 },
             ],
         };
-        assert_eq!(merge_feed(&mut show, &feed), 2);
+        assert_eq!(merge_feed(&mut show, &feed), 1);
+        assert_eq!(show.image_url, "http://x/show.jpg");
+        assert_eq!(show.episodes[0].image_url, "http://x/2.jpg");
+        // The existing episode got its artwork; nothing else about it changed.
+        let one = &show.episodes[1];
+        assert_eq!((one.guid.as_str(), one.image_url.as_str(), one.state, one.cleaned_bytes), ("1", "http://x/1.jpg", State::Ready, 5));
+        // A changed image is followed; one that is gone from the feed is kept.
+        feed.image_url = String::new();
+        feed.items[1].image_url = "http://x/1b.jpg".into();
+        feed.items[0].image_url = String::new();
         assert_eq!(merge_feed(&mut show, &feed), 0);
-        assert_eq!(show.title, "Real");
-        assert_eq!(show.episodes[0].guid, "2");
+        assert_eq!(show.image_url, "http://x/show.jpg");
+        assert_eq!(show.episodes[1].image_url, "http://x/1b.jpg");
+        assert_eq!(show.episodes[0].image_url, "http://x/2.jpg");
     }
 }
