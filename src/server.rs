@@ -459,6 +459,7 @@ mod tests {
             },
             cleaned_bytes: 10,
             served: 0,
+            seen: false,
         };
         fs::create_dir_all(paths.show_dir(id)).unwrap();
         fs::write(paths.cleaned(id, &ep), b"0123456789").unwrap();
@@ -503,6 +504,7 @@ mod tests {
             let sh = shared.lock().unwrap();
             let e = &sh.lib.show(id).unwrap().episodes[0];
             assert_eq!(e.state, State::Delivered);
+            assert!(e.seen);
             assert!(!sh.paths.cleaned(id, e).exists());
             assert_eq!(e.record.sha256, "h");
         }

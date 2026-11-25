@@ -6,7 +6,7 @@ use crate::cutlist::{self, Cut};
 use crate::ffargs;
 use crate::progress;
 use crate::rss;
-use crate::store::{sha256_file, Channels, Episode, Paths, Settings, Show, State};
+use crate::store::{sha256_file, Channels, Episode, Library, Paths, Settings, Show, State};
 use crate::transcript;
 use std::fs;
 use std::path::Path;
@@ -71,6 +71,7 @@ pub fn merge_feed(show: &mut Show, feed: &rss::SourceFeed) -> usize {
                 record: Default::default(),
                 cleaned_bytes: 0,
                 served: 0,
+                seen: false,
             },
         );
         added += 1;
@@ -212,9 +213,96 @@ pub fn transcribe(
     Ok(())
 }
 
-/// Parse + validate an AI reply against this episode.
+/// Parse + validate an AI reply against this episode. The reply must carry
+/// exactly one hash line, and that hash must be this episode's. Prefer
+/// `check_one` when the episode is chosen from the library by hash.
 pub fn check_reply(ep: &Episode, reply: &str) -> Result<Vec<Cut>, String> {
-    cutlist::validate(cutlist::parse_reply(reply)?, ep.record.duration)
+    let want = ep
+        .record
+        .short_hash()
+        .ok_or("this episode has no audio hash. Download it again.")?;
+    let mut sections = cutlist::parse_sections(reply)?;
+    if sections.len() > 1 {
+        return Err(format!(
+            "the reply has {} hash lines, but a reply for one episode has one",
+            sections.len()
+        ));
+    }
+    let s = sections.remove(0);
+    if s.hash != want {
+        return Err(format!(
+            "the reply's hash {} does not match this episode's hash {want}. It may be for another episode.",
+            s.hash
+        ));
+    }
+    cutlist::validate(s.cuts, ep.record.duration)
+}
+
+/// Cuts for one episode from a reply covering several.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BulkCut {
+    pub show: u32,
+    pub guid: String,
+    pub title: String,
+    pub show_title: String,
+    pub cuts: Vec<Cut>,
+}
+
+/// Check a single-hash reply and return the transcribed episode it names,
+/// regardless of which episode is selected. Errors when the hash is missing,
+/// when there is more than one hash line, or when the hash does not belong
+/// to a transcribed episode in the library.
+pub fn check_one(lib: &Library, reply: &str) -> Result<BulkCut, String> {
+    let n = cutlist::parse_sections(reply)?.len();
+    if n != 1 {
+        return Err(format!(
+            "the reply has {n} hash lines, but a reply for one episode has one"
+        ));
+    }
+    let mut list = check_bulk(lib, reply)?;
+    list.pop().ok_or_else(|| "the reply was not accepted".into())
+}
+
+/// Check a reply covering several episodes. Every hash must belong to a
+/// transcribed episode in the library, and every episode's ranges must be
+/// valid for it; otherwise nothing is accepted.
+pub fn check_bulk(lib: &Library, reply: &str) -> Result<Vec<BulkCut>, String> {
+    let sections = cutlist::parse_sections(reply)?;
+    let mut out = Vec::new();
+    for s in sections {
+        let found = lib.shows.iter().find_map(|sh| {
+            sh.episodes
+                .iter()
+                .find(|e| e.record.short_hash() == Some(s.hash.as_str()))
+                .map(|e| (sh, e))
+        });
+        let Some((show, ep)) = found else {
+            return Err(format!(
+                "hash {} does not match any episode in the library",
+                s.hash
+            ));
+        };
+        if ep.state != State::Transcribed {
+            return Err(format!(
+                "hash {} is \"{}\", which is not waiting for cuts",
+                s.hash, ep.title
+            ));
+        }
+        let cuts = cutlist::validate(s.cuts, ep.record.duration)
+            .map_err(|e| format!("\"{}\" (hash {}): {e}", ep.title, s.hash))?;
+        out.push(BulkCut {
+            show: show.id,
+            guid: ep.guid.clone(),
+            title: ep.title.clone(),
+            show_title: if show.title.is_empty() {
+                show.feed_url.clone()
+            } else {
+                show.title.clone()
+            },
+            cuts,
+        });
+    }
+    Ok(out)
 }
 
 /// Cut with approved cuts. Deletes the original afterwards; the record keeps
@@ -253,6 +341,8 @@ pub fn mark_delivered(paths: &Paths, show: u32, ep: &mut Episode) {
     let _ = fs::remove_file(paths.cleaned(show, ep));
     ep.served += 1;
     ep.state = State::Delivered;
+    // Sent to the podcast app: it counts as seen.
+    ep.seen = true;
 }
 
 /// Download the original again, check it is byte-for-byte the same file,
@@ -402,6 +492,7 @@ mod tests {
             record: Default::default(),
             cleaned_bytes: 0,
             served: 0,
+            seen: false,
         };
         (
             Fake {
@@ -428,8 +519,9 @@ mod tests {
             .record
             .transcript
             .starts_with("[00:00:00.000-00:00:10.000] Ad here"));
-        let cuts = check_reply(&ep, "00:00:00.000-00:00:10.000").unwrap();
-        assert!(check_reply(&ep, "00:00:00.000-00:05:00.000").is_err());
+        let h = format!("hash: {}\n", &ep.record.sha256[..12]);
+        let cuts = check_reply(&ep, &format!("{h}00:00:00.000-00:00:10.000")).unwrap();
+        assert!(check_reply(&ep, &format!("{h}00:00:00.000-00:05:00.000")).is_err());
         apply_cuts(&env, &s, &paths, 1, &mut ep, cuts).unwrap();
         assert_eq!(ep.state, State::Ready);
         assert!(paths.cleaned(1, &ep).exists());
@@ -441,6 +533,7 @@ mod tests {
 
         mark_delivered(&paths, 1, &mut ep);
         assert_eq!(ep.state, State::Delivered);
+        assert!(ep.seen);
         assert!(!paths.cleaned(1, &ep).exists());
 
         // Regenerate: no whisper call, same ffmpeg args.
@@ -478,7 +571,8 @@ mod tests {
             .iter()
             .any(|(st, f)| st == "Transcribing" && (*f - 0.525).abs() < 1e-9));
         env.seen.borrow_mut().clear();
-        let cuts = check_reply(&ep, "00:00:00.000-00:00:20.000").unwrap();
+        let h = format!("hash: {}\n", &ep.record.sha256[..12]);
+        let cuts = check_reply(&ep, &format!("{h}00:00:00.000-00:00:20.000")).unwrap();
         apply_cuts(&env, &s, &paths, 1, &mut ep, cuts).unwrap();
         // 40 s of the 80 s kept.
         assert!(env
@@ -533,6 +627,106 @@ mod tests {
         assert!(ep.record.cuts.is_empty() && ep.record.transcript.is_empty());
     }
 
+    fn transcribed(guid: &str, hash: &str, duration: f64) -> Episode {
+        Episode {
+            guid: guid.into(),
+            title: format!("Ep {guid}"),
+            pub_date: String::new(),
+            source_url: String::new(),
+            state: State::Transcribed,
+            record: crate::store::Record {
+                sha256: hash.into(),
+                duration,
+                ..Default::default()
+            },
+            cleaned_bytes: 0,
+            served: 0,
+            seen: false,
+        }
+    }
+
+    #[test]
+    fn reply_hash_must_match() {
+        let ep = transcribed("a", &"1a2b3c4d5e6f".repeat(5), 300.0);
+        let ok = check_reply(&ep, "hash: 1a2b3c4d5e6f\n00:00:10.000-00:00:20.000").unwrap();
+        assert_eq!(ok, vec![Cut { start: 10.0, end: 20.0 }]);
+        assert!(check_reply(&ep, "hash: 1a2b3c4d5e6f\nNONE").unwrap().is_empty());
+        let e = check_reply(&ep, "00:00:10.000-00:00:20.000").unwrap_err();
+        assert!(e.contains("no hash line"), "{e}");
+        let e = check_reply(&ep, "hash: ffffffffffff\n00:00:10.000-00:00:20.000").unwrap_err();
+        assert!(e.contains("does not match this episode's hash 1a2b3c4d5e6f"), "{e}");
+        let e = check_reply(&ep, "hash: 1a2b3c4d5e6f\nNONE\nhash: ffffffffffff\nNONE").unwrap_err();
+        assert!(e.contains("2 hash lines"), "{e}");
+        let mut no_hash = ep.clone();
+        no_hash.record.sha256.clear();
+        assert!(check_reply(&no_hash, "hash: 1a2b3c4d5e6f\nNONE").unwrap_err().contains("no audio hash"));
+    }
+
+    #[test]
+    fn single_reply_is_routed_by_hash() {
+        let mut lib = Library::default();
+        let a = lib.add_show("Show A".into(), "ua".into());
+        let b = lib.add_show("Show B".into(), "ub".into());
+        lib.show_mut(a).unwrap().episodes = vec![transcribed("sel", &"a".repeat(64), 300.0)];
+        lib.show_mut(b).unwrap().episodes = vec![transcribed("other", &"b".repeat(64), 300.0)];
+        // Hash of the episode that would be selected.
+        let got = check_one(&lib, "hash: aaaaaaaaaaaa\n00:00:10.000-00:00:20.000").unwrap();
+        assert_eq!(
+            (got.show, got.guid.as_str(), got.title.as_str(), got.show_title.as_str()),
+            (a, "sel", "Ep sel", "Show A")
+        );
+        assert_eq!(got.cuts, vec![Cut { start: 10.0, end: 20.0 }]);
+        // Hash of a different transcribed episode, not the selected one.
+        let got = check_one(&lib, "hash: bbbbbbbbbbbb\n00:00:01.000-00:00:02.000").unwrap();
+        assert_eq!(
+            (got.show, got.guid.as_str(), got.show_title.as_str()),
+            (b, "other", "Show B")
+        );
+        // The same lookup with no episode selected.
+        let got = check_one(&lib, "hash: aaaaaaaaaaaa\nNONE").unwrap();
+        assert!(got.cuts.is_empty() && got.guid == "sel");
+        // Unknown hash: refused, nothing is applied.
+        let e = check_one(&lib, "hash: ffffffffffff\nNONE").unwrap_err();
+        assert!(e.contains("ffffffffffff does not match any episode"), "{e}");
+        // No hash line: refused.
+        let e = check_one(&lib, "00:00:10.000-00:00:20.000").unwrap_err();
+        assert!(e.contains("no hash line"), "{e}");
+    }
+
+    #[test]
+    fn bulk_reply() {
+        let mut lib = Library::default();
+        let a = lib.add_show("A".into(), "u".into());
+        let b = lib.add_show("B".into(), "v".into());
+        lib.show_mut(a).unwrap().episodes = vec![
+            transcribed("a1", &"a".repeat(64), 600.0),
+            transcribed("a2", &"b".repeat(64), 600.0),
+        ];
+        let mut ready = transcribed("b2", &"d".repeat(64), 600.0);
+        ready.state = State::Ready;
+        lib.show_mut(b).unwrap().episodes = vec![transcribed("b1", &"c".repeat(64), 100.0), ready];
+        let reply = "hash: cccccccccccc\n00:00:00.000-00:00:30.000\n\
+                     hash: aaaaaaaaaaaa\nNONE\n\
+                     hash: bbbbbbbbbbbb\n00:05:00.000-00:06:00.000\n00:01:00.000-00:02:00.000\n";
+        let got = check_bulk(&lib, reply).unwrap();
+        assert_eq!(
+            got.iter().map(|c| (c.show, c.guid.as_str(), c.cuts.len())).collect::<Vec<_>>(),
+            [(b, "b1", 1), (a, "a1", 0), (a, "a2", 2)]
+        );
+        // Sorted for cutting.
+        assert_eq!(got[2].cuts[0].start, 60.0);
+        // Unknown hash: nothing is accepted.
+        let e = check_bulk(&lib, &format!("{reply}hash: 999999999999\nNONE")).unwrap_err();
+        assert!(e.contains("999999999999 does not match any episode"), "{e}");
+        // A hash that belongs to an episode that isn't waiting for cuts.
+        let e = check_bulk(&lib, "hash: dddddddddddd\nNONE").unwrap_err();
+        assert!(e.contains("not waiting for cuts"), "{e}");
+        // Ranges checked against the matching episode's own length (b1 is 100 s).
+        let e = check_bulk(&lib, "hash: aaaaaaaaaaaa\n00:03:00.000-00:04:00.000\nhash: cccccccccccc\n00:03:00.000-00:04:00.000").unwrap_err();
+        assert!(e.starts_with("\"Ep b1\" (hash cccccccccccc)"), "{e}");
+        assert!(check_bulk(&lib, "00:00:00.000-00:00:30.000").is_err());
+    }
+
     #[test]
     fn merge() {
         let mut show = Show {
@@ -541,6 +735,7 @@ mod tests {
             feed_url: "u".into(),
             token: "t".into(),
             episodes: vec![],
+            seen_rule_done: false,
         };
         let feed = rss::SourceFeed {
             title: "Real".into(),
