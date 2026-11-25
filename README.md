@@ -44,7 +44,7 @@ hash: 1a2b3c4d5e6f
 00:23:10.120-00:25:01.900
 ```
 
-The audio hash is the first 12 hex digits of the SHA-256 of the episode's original download, shown in Details. The prompt gives it to the AI. **Check cuts** refuses a reply with no `hash:` line or with a hash that isn't the selected episode's, and names the episode the hash belongs to if it is another one in the library. This keeps cuts meant for one episode from being applied to another. There is no override; if you are sure, edit the hash line in the reply box.
+The audio hash is the first 12 hex digits of the SHA-256 of the episode's original download, shown in Details. The prompt gives it to the AI. **Check cuts** and **Approve and cut** apply a reply with one `hash:` line to the transcribed episode that hash names, even if a different episode is selected, or none is. Details and the status line then say `Cuts are for: <show> - <episode>`, and that episode is selected in the list. The reply is refused only when the hash is missing or does not belong to a transcribed episode in the library. There is no override; if you are sure, edit the hash line in the reply box.
 
 A reply to a bulk prompt has one `hash:` line per episode, each followed by that episode's ranges or `NONE`:
 
@@ -55,7 +55,7 @@ hash: 0f9e8d7c6b5a
 NONE
 ```
 
-If any hash in it doesn't belong to a transcribed episode, or any episode's ranges don't fit it, the whole reply is refused and nothing is cut. A reply with one hash line pasted while no transcribed episode is selected is matched by its hash the same way.
+If any hash in it doesn't belong to a transcribed episode, or any episode's ranges don't fit it, the whole reply is refused and nothing is cut. A reply with one hash line is matched the same way, whether or not an episode is selected.
 
 `MM:SS.mmm` and plain seconds (`12.5-40`) are also accepted, as is a line `NONE` for no ads. Blank lines, lines starting with `#`, and Markdown code fences are ignored. JSON is also accepted:
 

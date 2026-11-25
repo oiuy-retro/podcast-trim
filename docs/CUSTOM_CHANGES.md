@@ -2,7 +2,7 @@
 
 - Only the newest episodes of a newly added show are NEW (`[episodes] new-on-add`, default 1); older ones are OLD and drawn dimmed. SENT episodes count as seen and are dimmed too, keeping their SENT tag. Right-click an episode to mark it, or every episode older than it, as seen or unseen. Shows from older libraries get this once on upgrade, after `library.json` is copied to `library-before-0.1.2.json`.
 
-- Every AI prompt carries the episode's audio hash (first 12 hex digits of the original's SHA-256), and Check cuts refuses a reply whose `hash:` line is missing or doesn't match.
+- Every AI prompt carries the episode's audio hash (first 12 hex digits of the original's SHA-256). Check cuts and Approve and cut apply a single-hash reply to the transcribed episode that hash names, even if another episode is selected; a reply is refused when the hash is missing or does not belong to a transcribed episode.
 
 - Bulk prompt: one AI prompt for up to `[prompt] bulk-size` (default 3) transcribed episodes, picked in a resizable list. The reply gives each episode's cuts under its hash, and Approve and cut cuts each matching episode.
 

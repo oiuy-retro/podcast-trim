@@ -6,7 +6,7 @@
 - SENT episodes count as seen and are drawn dimmed like OLD, keeping their SENT tag. Episodes sent before this version are marked seen once on upgrade.
 - Right-click menu on the episode list: Mark as seen, Mark as unseen, Mark older as seen, Mark older as unseen.
 - Libraries from 0.1.1 get the NEW rule once on first start; `library.json` is copied to `library-before-0.1.2.json` first. Older `library.json` files still load.
-- The AI prompt includes the episode's audio hash and asks the AI to start its reply with `hash: <hash>`. Check cuts refuses replies without it or with another episode's hash.
+- The AI prompt includes the episode's audio hash and asks the AI to start its reply with `hash: <hash>`. Check cuts and Approve and cut apply a single-hash reply to the transcribed episode that hash names, even if another episode is selected. A reply is refused when the hash is missing or does not belong to a transcribed episode.
 - **Bulk prompt...** copies one prompt for several transcribed episodes (at most **Bulk prompt size**, default 3, also `[prompt] bulk-size`). Check cuts matches each part of the reply to its episode by hash, and Approve and cut cuts them one after another.
 
 ## 0.1.1
