@@ -33,7 +33,7 @@ fn main() {
 
 const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="0.1.1.0" name="Podcast.Trim" type="win32"/>
+  <assemblyIdentity version="0.1.2.0" name="Podcast.Trim" type="win32"/>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
