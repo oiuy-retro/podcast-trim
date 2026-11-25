@@ -9,6 +9,7 @@ mod ui;
 
 #[cfg(windows)]
 fn main() {
+    podcast_trim::crash::install();
     std::process::exit(ui::run());
 }
 
