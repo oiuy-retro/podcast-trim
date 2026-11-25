@@ -1458,7 +1458,7 @@ fn show_details() {
     });
 }
 
-/// e.g. "Source mp3 55 kbps stereo (identical channels) -> Opus 32 kbps mono (Auto)".
+/// e.g. "Source mp3 55 kbps stereo (identical channels) -> Opus 64 kbps mono (Auto)".
 fn source_line(e: &store::Episode, s: &Settings) -> String {
     let r = &e.record;
     let mut src = r.codec.clone();
@@ -2071,7 +2071,7 @@ unsafe fn paint(hwnd: HWND) {
         if ui.options {
             let mut r = sr(ui, 28, 404, cw - 60, 110);
             let note = format!(
-                "Note: ffmpeg.exe, ffprobe.exe, whisper-cli.exe (with its DLLs beside it) and ggml-*.bin models are found next to Podcast Trim.exe, in a folder inside it, or on PATH. configuration.conf next to the exe can point to them anywhere else.\nThe feed server is listening on {}. Use 0.0.0.0 to reach it from your phone on the same network, or 127.0.0.1 for this PC only. Address and port changes need a restart.\nPC address for phone: leave it blank to use this PC's detected address ({}). Opus bitrate: Auto picks it from each episode's source (as Opus Convert does), or enter a number from 6 to 256.",
+                "Note: ffmpeg.exe, ffprobe.exe, whisper-cli.exe (with its DLLs beside it) and ggml-*.bin models are found next to Podcast Trim.exe, in a folder inside it, or on PATH. configuration.conf next to the exe can point to them anywhere else.\nThe feed server is listening on {}. Use 0.0.0.0 to reach it from your phone on the same network, or 127.0.0.1 for this PC only. Address and port changes need a restart.\nPC address for phone: leave it blank to use this PC's detected address ({}). Opus bitrate: Auto follows each episode's source and stays at or above 96 kbps stereo or 64 kbps mono, or enter a number from 6 to 256.",
                 ui.server_addr,
                 ui.lan.map(|i| i.to_string()).unwrap_or_else(|| "none found".into())
             );
