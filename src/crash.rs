@@ -3,7 +3,7 @@
 //! Release builds use `panic = "abort"` and a Windows subsystem, so a panic
 //! otherwise leaves no message. The panic hook runs before abort. Stack
 //! overflows and access violations do not run that hook; on Windows an
-//! unhandled-exception filter and a vectored handler record those too.
+//! unhandled-exception filter records those too.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
