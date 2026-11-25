@@ -257,35 +257,26 @@ fn record_exception(code: u32, address: usize) {
 #[cfg(windows)]
 fn install_exception_handlers() {
     use windows::Win32::System::Diagnostics::Debug::{
-        AddVectoredExceptionHandler, SetUnhandledExceptionFilter, EXCEPTION_CONTINUE_SEARCH,
-        EXCEPTION_POINTERS,
+        SetUnhandledExceptionFilter, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
     };
 
-    fn take(info: *const EXCEPTION_POINTERS) {
+    // Only the unhandled-exception filter: a vectored handler would also
+    // see first-chance access violations that Windows or Wine then handle
+    // (delay-loaded DLLs, guard pages), and would write a false crash.log.
+    unsafe extern "system" fn on_unhandled(info: *const EXCEPTION_POINTERS) -> i32 {
         if let Some(info) = unsafe { info.as_ref() } {
             if let Some(rec) = unsafe { info.ExceptionRecord.as_ref() } {
                 let code = rec.ExceptionCode.0 as u32;
                 let addr = rec.ExceptionAddress as usize;
-                // Ignore breakpoint / single-step (debuggers).
                 if code != 0x80000003 && code != 0x80000004 {
                     record_exception(code, addr);
                 }
             }
         }
-    }
-
-    unsafe extern "system" fn on_vectored(info: *mut EXCEPTION_POINTERS) -> i32 {
-        take(info as *const EXCEPTION_POINTERS);
-        EXCEPTION_CONTINUE_SEARCH
-    }
-
-    unsafe extern "system" fn on_unhandled(info: *const EXCEPTION_POINTERS) -> i32 {
-        take(info);
         EXCEPTION_CONTINUE_SEARCH
     }
 
     unsafe {
-        let _ = AddVectoredExceptionHandler(1, Some(on_vectored));
         let _ = SetUnhandledExceptionFilter(Some(on_unhandled));
     }
 }
