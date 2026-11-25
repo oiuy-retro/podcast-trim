@@ -11,7 +11,7 @@ use podcast_trim::queue::{self, JobId, Queue};
 use podcast_trim::server::{self, Shared, SharedRef};
 use podcast_trim::store::{self, load_json_report, save_json, Library, Paths, Settings, State};
 use podcast_trim::winstate::{self, WinState};
-use podcast_trim::{cutlist, ffargs, prompt, refresh, rss, seen, tools};
+use podcast_trim::{artwork, cutlist, ffargs, prompt, refresh, rss, seen, tools, transcript};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
@@ -1794,6 +1794,7 @@ fn show_details() {
                         ));
                         for c in &e.record.cuts {
                             t.push_str(&format!("  {} - {}\n", format_time(c.start), format_time(c.end)));
+                            append_cut_words(&mut t, &e.record.transcript, c.start, c.end);
                         }
                         t.push_str(if e.state == State::Ready {
                             "\nIn the feed. It is deleted after one full download."
@@ -1814,7 +1815,19 @@ fn show_details() {
     });
 }
 
-/// e.g. "Source mp3 55 kbps stereo (identical channels) -> Opus 32 kbps mono (Auto)".
+/// Words from the transcript that overlap a cut, indented under its times.
+fn append_cut_words(t: &mut String, transcript: &str, start: f64, end: f64) {
+    let words = transcript::text_in_range(transcript, start, end);
+    t.push_str("  ");
+    if words.is_empty() {
+        t.push_str("(no transcript text in this range)");
+    } else {
+        t.push_str(&words);
+    }
+    t.push('\n');
+}
+
+/// e.g. "Source mp3 55 kbps stereo (identical channels) -> Opus 64 kbps mono (Auto)".
 fn source_line(e: &store::Episode, s: &Settings) -> String {
     let r = &e.record;
     let mut src = r.codec.clone();
@@ -2138,6 +2151,9 @@ fn episode_job(
         let settings = tools::resolve(&settings, &conf, &tools::exe_dir())?;
         let paths = Paths::new(root);
         let res = work(&settings, &paths, &mut ep);
+        if res.is_ok() && ep.state == State::Ready && !ep.image_url.is_empty() {
+            artwork::ensure_episode_url(&paths, show, &ep.image_url, &net::get);
+        }
         let mut sh = shared.lock().unwrap();
         if let Some(slot) = sh
             .lib
@@ -2325,6 +2341,18 @@ fn check_for_new(then_queue: bool) {
                 };
                 let done = |n: usize, total: usize| set_progress(STAGE, n as f64 / total as f64);
                 let out = refresh::check_all(&targets, 4, &net::get, &apply, &cancelled, &done);
+                if !cancelled() {
+                    let (paths, items): (Paths, Vec<_>) = {
+                        let sh = shared.lock().unwrap();
+                        let items = targets
+                            .iter()
+                            .filter_map(|(id, _, _)| sh.lib.show(*id))
+                            .map(|s| artwork::collect_show_urls(s, 10))
+                            .collect();
+                        (Paths::new(sh.paths.root.clone()), items)
+                    };
+                    artwork::sync_shows(&paths, &items, 4, &net::get, &cancelled);
+                }
                 let mut msg = refresh::summary(&out, targets.len(), out.len() < targets.len());
                 if then_queue && !cancelled() {
                     let mut sh = shared.lock().unwrap();
@@ -2559,15 +2587,24 @@ fn on_command(id: i32, code: u32) {
             background("Reading feed", move |shared| {
                 let xml = net::get(&url)?;
                 let feed = rss::parse(&String::from_utf8_lossy(&xml))?;
-                let mut sh = shared.lock().unwrap();
-                if sh.lib.shows.iter().any(|s| s.feed_url == url) {
-                    return Err("That show is already in the list.".into());
-                }
-                let keep_new = sh.conf.new_on_add();
-                let id = sh.lib.add_show(feed.title.clone(), url);
-                let show = sh.lib.show_mut(id).unwrap();
-                let n = pipeline::merge_feed(show, &feed);
-                let old = seen::apply_rule(show, keep_new);
+                let (n, old, item, paths) = {
+                    let mut sh = shared.lock().unwrap();
+                    if sh.lib.shows.iter().any(|s| s.feed_url == url) {
+                        return Err("That show is already in the list.".into());
+                    }
+                    let keep_new = sh.conf.new_on_add();
+                    let id = sh.lib.add_show(feed.title.clone(), url);
+                    let show = sh.lib.show_mut(id).unwrap();
+                    let n = pipeline::merge_feed(show, &feed);
+                    let old = seen::apply_rule(show, keep_new);
+                    (
+                        n,
+                        old,
+                        artwork::collect_show_urls(show, 10),
+                        Paths::new(sh.paths.root.clone()),
+                    )
+                };
+                artwork::sync_show_item(&paths, &item, &net::get);
                 Ok(if old == 0 {
                     format!("Added {} with {}.", feed.title, store::plural(n, "episode"))
                 } else {
@@ -2676,6 +2713,8 @@ fn on_command(id: i32, code: u32) {
                                 format_time(c.end),
                                 format_time(c.end - c.start)
                             ));
+                            append_cut_words(&mut t, &ep.record.transcript, c.start, c.end);
+                            t.push('\n');
                         }
                         t.push_str("\nffmpeg command the app will run:\n");
                         t.push_str(&ffargs::display("ffmpeg.exe", &args));
@@ -3100,7 +3139,7 @@ unsafe fn paint(hwnd: HWND) {
             );
             let mut r = sr(ui, 28, 404, cw - 60, 110);
             let note = format!(
-                "Note: ffmpeg.exe, ffprobe.exe, whisper-cli.exe (with its DLLs beside it) and ggml-*.bin models are found next to Podcast Trim.exe, in a folder inside it, or on PATH. configuration.conf next to the exe can point to them anywhere else.\nThe feed server is listening on {}. Use 0.0.0.0 to reach it from your phone on the same network, or 127.0.0.1 for this PC only. Address and port changes need a restart.\nPC address for phone: leave it blank to use this PC's detected address ({}). Opus bitrate: Auto picks it from each episode's source (as Opus Convert does), or enter a number from 6 to 256.",
+                "Note: ffmpeg.exe, ffprobe.exe, whisper-cli.exe (with its DLLs beside it) and ggml-*.bin models are found next to Podcast Trim.exe, in a folder inside it, or on PATH. configuration.conf next to the exe can point to them anywhere else.\nThe feed server is listening on {}. Use 0.0.0.0 to reach it from your phone on the same network, or 127.0.0.1 for this PC only. Address and port changes need a restart.\nPC address for phone: leave it blank to use this PC's detected address ({}). Opus bitrate: Auto follows each episode's source and stays at or above 96 kbps stereo or 64 kbps mono, or enter a number from 6 to 256.",
                 ui.server_addr,
                 ui.lan.map(|i| i.to_string()).unwrap_or_else(|| "none found".into())
             );

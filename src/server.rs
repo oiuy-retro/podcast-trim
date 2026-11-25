@@ -6,6 +6,7 @@
 //! When the bytes sent for a cleaned file cover the whole file, it is deleted
 //! and the episode is marked Delivered (record kept).
 
+use crate::artwork;
 use crate::pipeline;
 use crate::rss;
 use crate::store::{save_json, Library, Paths, Settings, State};
@@ -166,6 +167,15 @@ pub fn feed_xml(shared: &Shared, show_id: u32, host: &str) -> Option<String> {
         String::new()
     };
     let base = format!("http://{host}");
+    let manifest = artwork::load_manifest(&shared.paths, show_id);
+    let art_url = |src: &str| -> String {
+        if let Some(file) = artwork::cached_file(&shared.paths, show_id, &manifest, src) {
+            format!("{base}/art/{show_id}/{file}{tok}")
+        } else {
+            src.to_string()
+        }
+    };
+    let show_image = art_url(&show.image_url);
     let items: Vec<rss::OutItem> = show
         .episodes
         .iter()
@@ -181,11 +191,13 @@ pub fn feed_xml(shared: &Shared, show_id: u32, host: &str) -> Option<String> {
                 crate::cutlist::format_time(crate::cutlist::removed_seconds(&e.record.cuts)),
                 e.record.cuts.len()
             ),
+            image_url: art_url(&e.image_url),
         })
         .collect();
     Some(rss::generate(
         &show.title,
         &format!("{base}/feed/{show_id}.xml{tok}"),
+        &show_image,
         &items,
     ))
 }
@@ -249,6 +261,34 @@ fn handle(mut stream: TcpStream, shared: SharedRef, notify: Notify) {
                     head,
                 ),
             }
+        }
+        ["art", show, file] => {
+            let Ok(id) = show.parse::<u32>() else {
+                return respond(&mut stream, "404 Not Found", "text/plain", b"not found", head);
+            };
+            if !artwork::is_safe_cache_file(file) {
+                return respond(&mut stream, "404 Not Found", "text/plain", b"not found", head);
+            }
+            let path = {
+                let sh = shared.lock().unwrap();
+                let ok = sh
+                    .lib
+                    .show(id)
+                    .map(|s| {
+                        !sh.settings.require_token || token_ok(&s.token, req.query.get("token"))
+                    })
+                    .unwrap_or(false);
+                ok.then(|| sh.paths.art_file(id, file))
+            };
+            let Some(bytes) = path.and_then(|p| fs::read(&p).ok()) else {
+                return respond(&mut stream, "404 Not Found", "text/plain", b"not found", head);
+            };
+            let ctype = if file.ends_with(".png") {
+                "image/png"
+            } else {
+                "image/jpeg"
+            };
+            respond(&mut stream, "200 OK", ctype, &bytes, head);
         }
         ["media", show, file] => {
             let (Ok(id), Some(key)) = (show.parse::<u32>(), file.strip_suffix(".opus")) else {
@@ -460,7 +500,9 @@ mod tests {
             cleaned_bytes: 10,
             served: 0,
             seen: false,
+            image_url: "http://x/e.jpg?a=1&b=2".into(),
         };
+        lib.show_mut(id).unwrap().image_url = "http://x/s.jpg".into();
         fs::create_dir_all(paths.show_dir(id)).unwrap();
         fs::write(paths.cleaned(id, &ep), b"0123456789").unwrap();
         let key = ep.key();
@@ -489,6 +531,10 @@ mod tests {
         let xml = String::from_utf8(body).unwrap();
         let media = format!("/media/{id}/{key}.opus?token={token}");
         assert!(xml.contains(&format!("http://{addr}{}", media.replace('&', "&amp;"))));
+        // Artwork from the source feed is passed on.
+        assert!(xml.contains("<itunes:image href=\"http://x/s.jpg\"/>"));
+        assert!(xml.contains("<image><url>http://x/s.jpg</url>"));
+        assert!(xml.contains("<itunes:image href=\"http://x/e.jpg?a=1&amp;b=2\"/>"));
 
         let (h, body) = get(addr, &media, "Range: bytes=0-4\r\n");
         assert!(h.contains("206") && h.contains("bytes 0-4/10"));
@@ -512,5 +558,110 @@ mod tests {
         assert!(h.contains("410"));
         let (_, body) = get(addr, &format!("/feed/{id}.xml?token={token}"), "");
         assert!(!String::from_utf8(body).unwrap().contains("<item>"));
+    }
+
+    #[test]
+    fn feed_points_at_cached_badged_artwork_and_server_serves_it() {
+        let root = std::env::temp_dir().join(format!("pt-srv-art-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let paths = Paths::new(root.clone());
+        let mut lib = Library::default();
+        let id = lib.add_show("Show".into(), "u".into());
+        lib.show_mut(id).unwrap().image_url = "http://x/show.jpg".into();
+
+        let make_ep = |guid: &str, img: &str| Episode {
+            guid: guid.into(),
+            title: guid.into(),
+            pub_date: String::new(),
+            source_url: "x".into(),
+            state: State::Ready,
+            record: Record {
+                sha256: "h".into(),
+                transcript: "t".into(),
+                ..Default::default()
+            },
+            cleaned_bytes: 5,
+            served: 0,
+            seen: false,
+            image_url: img.into(),
+        };
+        let ep_same = make_ep("g-same", "http://x/show.jpg");
+        let ep_own = make_ep("g-own", "http://x/ep.jpg");
+        let ep_none = make_ep("g-none", "");
+        fs::create_dir_all(paths.show_dir(id)).unwrap();
+        for ep in [&ep_same, &ep_own, &ep_none] {
+            fs::write(paths.cleaned(id, ep), b"12345").unwrap();
+        }
+        lib.show_mut(id).unwrap().episodes.extend([ep_same, ep_own, ep_none]);
+
+        // Populate cache as sync_show_item does.
+        let show_file = artwork::cache_filename("hash-show", artwork::STYLE_VERSION);
+        let ep_file = artwork::cache_filename("hash-ep", artwork::STYLE_VERSION);
+        fs::create_dir_all(paths.art_dir(id)).unwrap();
+        fs::write(paths.art_file(id, &show_file), b"FAKEJPEG_SHOW").unwrap();
+        fs::write(paths.art_file(id, &ep_file), b"FAKEJPEG_EP").unwrap();
+        let mut manifest = artwork::ArtManifest::default();
+        manifest.entries.insert(
+            "http://x/show.jpg".into(),
+            artwork::ArtEntry {
+                style: artwork::STYLE_VERSION.into(),
+                source_hash: "hash-show".into(),
+                file: show_file.clone(),
+            },
+        );
+        manifest.entries.insert(
+            "http://x/ep.jpg".into(),
+            artwork::ArtEntry {
+                style: artwork::STYLE_VERSION.into(),
+                source_hash: "hash-ep".into(),
+                file: ep_file.clone(),
+            },
+        );
+        fs::write(
+            paths.art_manifest(id),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let token = lib.show(id).unwrap().token.clone();
+        let shared: SharedRef = Arc::new(Mutex::new(Shared {
+            lib,
+            conf: Default::default(),
+            settings: Settings {
+                bind: "127.0.0.1".into(),
+                port: 0,
+                ..Default::default()
+            },
+            queue: Default::default(),
+            paths,
+            coverage: HashMap::new(),
+            log: vec![],
+        }));
+        let addr = start(shared, Arc::new(|| {})).unwrap();
+
+        let (h, body) = get(addr, &format!("/feed/{id}.xml?token={token}"), "");
+        assert!(h.contains("200"));
+        let xml = String::from_utf8(body).unwrap();
+        let show_art_url = format!("http://{addr}/art/{id}/{show_file}?token={token}");
+        let ep_art_url = format!("http://{addr}/art/{id}/{ep_file}?token={token}");
+        assert!(xml.contains(&format!("<itunes:image href=\"{show_art_url}\"/>")), "{xml}");
+        assert!(xml.contains(&format!("<image><url>{show_art_url}</url>")), "{xml}");
+        assert!(xml.contains(&format!("<itunes:image href=\"{ep_art_url}\"/>")), "{xml}");
+        // Matching episode URL reuses the show cover URL, and empty art keeps none.
+        assert_eq!(xml.matches(&show_art_url).count(), 3); // channel itunes + channel image + g-same item
+        assert!(!xml.contains("http://x/show.jpg"));
+        assert!(!xml.contains("http://x/ep.jpg"));
+
+        // Serving the art requires the token when enabled.
+        let (h, _) = get(addr, &format!("/art/{id}/{show_file}"), "");
+        assert!(h.contains("404"));
+        let (h, bytes) = get(addr, &format!("/art/{id}/{show_file}?token={token}"), "");
+        assert!(h.contains("200") && h.contains("image/jpeg"));
+        assert_eq!(bytes, b"FAKEJPEG_SHOW");
+        let (h, bytes) = get(addr, &format!("/art/{id}/{ep_file}?token={token}"), "");
+        assert!(h.contains("200"));
+        assert_eq!(bytes, b"FAKEJPEG_EP");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

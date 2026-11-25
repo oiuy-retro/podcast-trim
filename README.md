@@ -9,7 +9,7 @@ A built copy is [`Podcast.Trim.exe`](https://github.com/oiuy-retro/podcast-trim/
 1. You add a show by pasting its RSS link. Podcast Trim reads the feed and lists its episodes. **Check for new** reads every show's feed (up to four at a time) and adds new episodes. A show whose feed can't be read is skipped, and the status line says, for example, `Lateral: 2 new episodes. Show B: no new episodes. Show C: couldn't check (feeds.example.com returned HTTP 404).` With more than three shows it gives a total instead.
 2. **Download + transcribe** downloads an episode, records the SHA-256 hash of the file, and transcribes it on the CPU with [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Every transcript line has start and end times. You can Shift-click or Ctrl-click several episodes and press the button once; they are queued and done one after another. Waiting episodes are marked `[QUEUED]` in the list, and the status line shows for example `Queue 2 of 5: Episode title — transcribing 35%`. A leftover queue is saved and offered again the next time the app starts. A progress bar at the bottom of the window follows the download, the transcription, and the cutting, and Cancel stops the running step (and the rest of the queue) and its ffmpeg or whisper.cpp process.
 3. **Copy AI prompt** copies a ready-made prompt plus the transcript to the clipboard. Paste it into any AI chat. No AI service is built in and nothing is sent anywhere by the app.
-4. Paste the AI's reply into the reply box and press **Check cuts**. The reply must be a list of ad time ranges (format below). Podcast Trim never runs commands from the reply. It checks that every range is inside the episode, ends after it starts, and does not overlap another range, then shows the cut list and the exact ffmpeg command it will run.
+4. Paste the AI's reply into the reply box and press **Check cuts**. The reply must be a list of ad time ranges (format below). Podcast Trim never runs commands from the reply. It checks that every range is inside the episode, ends after it starts, and does not overlap another range, then shows each range with the transcript words inside it (so you can see the cut is an ad) and the exact ffmpeg command it will run.
 5. **Approve and cut** runs ffmpeg itself (as an argument list, without a shell) and writes an Ogg Opus file (`.opus`) without the ads. The original download is deleted.
 6. The trimmed episode appears in that show's feed at `http://<this-pc>:8737/feed/<show-id>.xml`. The link uses this PC's detected network address unless **PC address for phone** is set in Options. Subscribe to that link in AntennaPod or another podcast app.
 7. Once a client has downloaded every byte of a trimmed file, the file is deleted and the episode is marked SENT. The app keeps the hash, the transcript, the cut list, and the ffmpeg arguments.
@@ -41,6 +41,7 @@ Three ways put NEW episodes into the download + transcribe queue without picking
 To queue NEW episodes after every Check for new, tick **Queue NEW after Check for new** in Options (`[episodes] queue-after-refresh = on` in `configuration.conf`, off by default).
 
 Only NEW episodes are queued: OLD and SENT episodes, episodes already downloaded, transcribed or further along, and episodes already queued or running are left out. A failed or cancelled job counts as waiting again. The queue starts by itself once anything is added.
+
 
 ### Bulk AI prompt
 
@@ -85,29 +86,38 @@ Anything else is rejected with the line number of the problem.
 - The server speaks plain HTTP. To reach it from outside your home network, use a private VPN such as Tailscale instead of opening a port on your router.
 - Windows Firewall will ask whether to allow Podcast Trim on the network the first time it starts. Allow it on private networks.
 
+### Artwork
+
+Each show's feed carries the artwork of the source feed, stamped at the bottom with **TRIMMED** in Impact (white with a black border) so trimmed feeds stand out in your podcast app.
+
+- Show artwork is read from the source feed's `<itunes:image href="...">`, or from its RSS 2.0 `<image><url>` when there is no `itunes:image`.
+- Episode artwork is read from each item's `<itunes:image href="...">`, then `<media:thumbnail url="...">`, then an image `<media:content url="...">` (with `medium="image"` or an `image/...` type). Episodes without their own picture inherit the show's badged cover.
+- When you add a show or run **Check for new** (and when an episode finishes cutting), Podcast Trim downloads the cover, draws the badge with Windows' own `impact.ttf` (no font file is bundled; if Impact or a source cover is missing, it falls back to the unbadged URL), caches the result in `shows/<id>/art/`, and serves it from `/art/<show-id>/<hash>.jpg`. Episodes whose URL matches the show cover reuse the show's cached file.
+- Shows added before this version get their badged cover the next time **Check for new** runs. Refresh the feed in AntennaPod afterwards; AntennaPod may keep showing an earlier cached cover until its image cache updates.
+
 ## Audio format
 
 Trimmed episodes are Ogg Opus (`.opus`, encoded with libopus, variable bitrate). With **Opus bitrate** and **Channels** set to Auto (the defaults), both are picked from the original with ffprobe.
 
 **Channels.** A mono source is encoded mono. For a stereo source, three 10-second samples (at 15%, 50% and 85% of the episode) are checked: if the difference between the channels (L-R) is at least 30 dB quieter than their sum (L+R), the two channels are the same and the episode is encoded mono. Real stereo is usually only 6 to 20 dB quieter; mono saved as stereo is 40 dB or more. Channels can also be set to Mono or Stereo.
 
-**Bitrate.** The stereo bitrate comes from this table. Low-bitrate sources get lower tiers than Opus Convert uses, because Opus is about as good at 48k as MP3 is at 64k, so a trimmed file is never needlessly bigger than its source. From 129k up the tiers are the same as Opus Convert's.
+**Bitrate.** Auto follows the source, then stays at or above 96 kbps stereo and 64 kbps mono. Those floors are there so the file still sounds all right when a podcast app plays it at 2× or faster. Above 128 kbps the rate steps up with the source.
 
 | Source | Stereo Opus bitrate |
 | --- | --- |
-| MP3/WMA | ≤40 → 32k, 41–64 → 48k, 65–96 → 64k, 97–128 → 96k, 129–192 → 128k, 193–256 → 160k, 257+ → 192k |
-| AAC/Vorbis | ≤40 → 32k, 41–64 → 48k, 65–96 → 64k, 97–128 → 96k, 129–192 → 128k, 193+ → 160k |
+| MP3/WMA | ≤128 → 96k, 129–192 → 128k, 193–256 → 160k, 257+ → 192k |
+| AAC/Vorbis | ≤128 → 96k, 129–192 → 128k, 193+ → 160k |
 | AC-3 | ≤192 → 128k, 193–384 → 160k, 385+ → 192k |
 | Lossless, DTS | 192k |
-| Opus | its own bitrate, rounded up to 24, 32, 48, 64, 96, 128, 160 or 192k (cutting always re-encodes, so it can't be copied) |
+| Opus | its own bitrate, rounded up to the next tier and then up to the floor (cutting always re-encodes, so it can't be copied) |
 
-Mono uses about 60% of the stereo bitrate, rounded up, and never less than 24k:
+When the channels match, the file is mono at about 60% of the stereo rate, and never under 64k:
 
-| Stereo | 32k | 48k | 64k | 96k | 128k | 160k | 192k |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Mono | 24k | 32k | 40k | 64k | 80k | 96k | 128k |
+| Stereo | 96k | 128k | 160k | 192k |
+| --- | --- | --- | --- | --- |
+| Mono | 64k | 80k | 96k | 128k |
 
-Details shows the result, for example `Source mp3 55 kbps stereo (identical channels) → Opus 32 kbps mono (Auto)`. A fixed bitrate (6 to 256 kbit/s) can be entered instead of Auto. Settings from older versions with the **Mono** checkbox ticked become Channels: Mono. Feeds list them with the MIME type `audio/ogg`, the registered type for Ogg Opus files (RFC 7845). AntennaPod plays them through its built-in player (ExoPlayer) on Android 5 and later.
+Details shows the result, for example `Source mp3 55 kbps stereo (identical channels) → Opus 64 kbps mono (Auto)`. A fixed bitrate (6 to 256 kbit/s) can be entered instead of Auto. A typed number is used as entered, including one under the floor. Settings from older versions with the **Mono** checkbox ticked become Channels: Mono. Feeds list them with the MIME type `audio/ogg`, the registered type for Ogg Opus files (RFC 7845). AntennaPod plays them through its built-in player (ExoPlayer) on Android 5 and later.
 
 ## Run
 

@@ -324,6 +324,7 @@ impl Conf {
             .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "yes" | "true" | "1"))
     }
 
+
     /// `[prompt] bulk-size`; missing or invalid means the default (3).
     pub fn bulk_size(&self) -> usize {
         self.get("prompt", "bulk-size")

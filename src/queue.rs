@@ -705,6 +705,7 @@ mod tests {
             cleaned_bytes: 0,
             served: 0,
             seen,
+            image_url: String::new(),
         };
         lib.show_mut(a).unwrap().episodes = vec![
             mk("new1", State::New, false),
@@ -742,6 +743,7 @@ mod tests {
             cleaned_bytes: 0,
             served: 0,
             seen: false,
+            image_url: String::new(),
         };
         lib.show_mut(a).unwrap().episodes = vec![
             mk("run", State::New),
@@ -798,6 +800,7 @@ mod tests {
             cleaned_bytes: 0,
             served: 0,
             seen,
+            image_url: String::new(),
         };
         lib.show_mut(a).unwrap().episodes = (0..21).map(|i| mk(&format!("a{i}"), false)).collect();
         lib.show_mut(b).unwrap().episodes = (0..40)
