@@ -452,15 +452,26 @@ impl Neg for i32 {
 }
 
 pub fn run() -> i32 {
+    podcast_trim::crash::trace_detail("data dir", &store::data_dir().display().to_string());
     let paths = Paths::new(store::data_dir());
     let _ = std::fs::create_dir_all(&paths.root);
+    podcast_trim::crash::trace("data dir created");
     let (settings, settings_note) = if paths.settings().exists() {
         let (s, n) = load_json_report::<Settings>(&paths.settings());
         (s.migrate(), n)
     } else {
         (Settings::default(), None)
     };
+    podcast_trim::crash::trace("settings loaded");
     let (mut lib, lib_note): (Library, Option<String>) = load_json_report(&paths.library());
+    podcast_trim::crash::trace_detail(
+        "library loaded",
+        &format!(
+            "{} shows, {} episodes",
+            lib.shows.len(),
+            lib.shows.iter().map(|s| s.episodes.len()).sum::<usize>()
+        ),
+    );
     // Clean up anything left behind by a delivery that couldn't delete at the time.
     for show in &lib.shows {
         for ep in &show.episodes {
@@ -476,6 +487,7 @@ pub fn run() -> i32 {
     let channels = settings.channels;
     let model = settings.whisper_model.clone();
     let mut conf = Conf::load(&tools::exe_dir(), &paths.root);
+    podcast_trim::crash::trace("config loaded");
     if conf.folder("export").is_empty() && !settings.export_dir.trim().is_empty() {
         let _ = conf.set_folder("export", settings.export_dir.trim());
     }
@@ -494,6 +506,10 @@ pub fn run() -> i32 {
         Queue::load_report(&paths.queue())
     };
     let pending_on_start = queue.pending_count();
+    podcast_trim::crash::trace_detail(
+        "queue loaded",
+        &format!("{pending_on_start} pending"),
+    );
     let load_notes: Vec<String> = [settings_note, lib_note, queue_note]
         .into_iter()
         .flatten()
@@ -581,8 +597,13 @@ pub fn run() -> i32 {
         )
         .unwrap_or_default();
         if hwnd.0.is_null() {
+            podcast_trim::crash::trace("CreateWindow failed");
             return 1;
         }
+        podcast_trim::crash::trace_detail(
+            "window created",
+            &format!("{}x{} at {},{} maximized={maximized}", place.2, place.3, place.0, place.1),
+        );
         MAIN.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
         let ui = Ui {
             hwnd,
@@ -630,8 +651,11 @@ pub fn run() -> i32 {
         );
         FONT.store(ui.font.0 as isize, std::sync::atomic::Ordering::Relaxed);
         UI.with(|u| *u.borrow_mut() = Some(ui));
+        podcast_trim::crash::trace("ui installed");
         build_controls(instance);
+        podcast_trim::crash::trace("controls built");
         layout();
+        podcast_trim::crash::trace("layout after controls");
         let hraw = hwnd.0 as isize;
         let notify: server::Notify = Arc::new(move || {
             let _ = PostMessageW(HWND(hraw as _), WM_REFRESH, WPARAM(0), LPARAM(0));
@@ -662,7 +686,9 @@ pub fn run() -> i32 {
             with(|ui| ui.shared.lock().unwrap().note(note.clone()));
             start_notes.push(note);
         }
+        podcast_trim::crash::trace("refresh lists");
         refresh_lists();
+        podcast_trim::crash::trace("lists ready");
         if queue_preview {
             apply_queue_preview();
         } else if !start_notes.is_empty() {
@@ -686,7 +712,9 @@ pub fn run() -> i32 {
                 )
             });
         }
+        podcast_trim::crash::trace("ShowWindow");
         let _ = ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW });
+        podcast_trim::crash::trace("entering message loop");
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             if picker::current().is_some_and(|p| IsDialogMessageW(p, &msg).as_bool()) {
@@ -1035,6 +1063,7 @@ fn anchored(r: (i32, i32, i32, i32), a: Anchor, dx: i32, dy: i32) -> (i32, i32, 
 
 /// Place everything for the current client size.
 fn layout() {
+    podcast_trim::crash::trace_first_layout();
     with(|ui| unsafe {
         let d = ui.dpi;
         let mut rc = RECT::default();
@@ -2972,6 +3001,7 @@ unsafe fn arrow(dc: HDC, r: &RECT, up: bool, color: u32) {
 }
 
 unsafe fn paint(hwnd: HWND) {
+    podcast_trim::crash::trace_first_paint();
     let mut ps = PAINTSTRUCT::default();
     let dc = BeginPaint(hwnd, &mut ps);
     with(|ui| {
@@ -3838,6 +3868,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_NCCALCSIZE => {
+            podcast_trim::crash::trace_first_nccalcsize();
             // No system frame: the client area is the whole window (the
             // first RECT of either form of lParam). A maximized window hangs
             // over the work area by the frame size; clip the client to the
@@ -3894,6 +3925,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_SIZE => {
+            podcast_trim::crash::trace_first_size();
             if wp.0 as u32 != SIZE_MINIMIZED {
                 remember_normal(hwnd);
                 layout();
