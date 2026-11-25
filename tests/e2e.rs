@@ -57,6 +57,7 @@ fn episode(guid: &str) -> Episode {
         record: Default::default(),
         cleaned_bytes: 0,
         served: 0,
+        seen: false,
         image_url: String::new(),
     }
 }
@@ -160,12 +161,14 @@ fn real_tools() {
         record: Default::default(),
         cleaned_bytes: 0,
         served: 0,
+        seen: false,
         image_url: String::new(),
     };
     pipeline::download(&env, &s, &paths, 1, &mut ep).unwrap();
     pipeline::transcribe(&env, &s, &paths, 1, &mut ep).unwrap();
     println!("duration {}\n{}", ep.record.duration, ep.record.transcript);
-    let cuts = pipeline::check_reply(&ep, "00:00:02.000-00:00:04.000").unwrap();
+    let reply = format!("hash: {}\n00:00:02.000-00:00:04.000", ep.record.short_hash().unwrap());
+    let cuts = pipeline::check_reply(&ep, &reply).unwrap();
     pipeline::apply_cuts(&env, &s, &paths, 1, &mut ep, cuts).unwrap();
     let out = paths.cleaned(1, &ep);
     let probed = env

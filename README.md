@@ -7,9 +7,9 @@ A built copy is [`Podcast.Trim.exe`](https://github.com/oiuy-retro/podcast-trim/
 ## What it does
 
 1. You add a show by pasting its RSS link. Podcast Trim reads the feed and lists its episodes. **Check for new** reads every show's feed (up to four at a time) and adds new episodes. A show whose feed can't be read is skipped, and the status line says, for example, `Lateral: 2 new episodes. Show B: no new episodes. Show C: couldn't check (feeds.example.com returned HTTP 404).` With more than three shows it gives a total instead.
-2. **Download + transcribe** downloads an episode, records the SHA-256 hash of the file, and transcribes it on the CPU with [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Every transcript line has start and end times. A progress bar at the bottom of the window follows the download, the transcription, and the cutting, and Cancel stops the running step and its ffmpeg or whisper.cpp process.
+2. **Download + transcribe** downloads an episode, records the SHA-256 hash of the file, and transcribes it on the CPU with [whisper.cpp](https://github.com/ggml-org/whisper.cpp). Every transcript line has start and end times. You can Shift-click or Ctrl-click several episodes and press the button once; they are queued and done one after another. Waiting episodes are marked `[QUEUED]` in the list, and the status line shows for example `Queue 2 of 5: Episode title — transcribing 35%`. A leftover queue is saved and offered again the next time the app starts. A progress bar at the bottom of the window follows the download, the transcription, and the cutting, and Cancel stops the running step (and the rest of the queue) and its ffmpeg or whisper.cpp process.
 3. **Copy AI prompt** copies a ready-made prompt plus the transcript to the clipboard. Paste it into any AI chat. No AI service is built in and nothing is sent anywhere by the app.
-4. Paste the AI's reply into the reply box and press **Check cuts**. The reply must be a list of ad time ranges (format below). Podcast Trim never runs commands from the reply. It checks that every range is inside the episode, ends after it starts, and does not overlap another range, then shows the cut list and the exact ffmpeg command it will run.
+4. Paste the AI's reply into the reply box and press **Check cuts**. The reply must be a list of ad time ranges (format below). Podcast Trim never runs commands from the reply. It checks that every range is inside the episode, ends after it starts, and does not overlap another range, then shows each range with the transcript words inside it (so you can see the cut is an ad) and the exact ffmpeg command it will run.
 5. **Approve and cut** runs ffmpeg itself (as an argument list, without a shell) and writes an Ogg Opus file (`.opus`) without the ads. The original download is deleted.
 6. The trimmed episode appears in that show's feed at `http://<this-pc>:8737/feed/<show-id>.xml`. The link uses this PC's detected network address unless **PC address for phone** is set in Options. Subscribe to that link in AntennaPod or another podcast app.
 7. Once a client has downloaded every byte of a trimmed file, the file is deleted and the episode is marked SENT. The app keeps the hash, the transcript, the cut list, and the ffmpeg arguments.
@@ -17,14 +17,45 @@ A built copy is [`Podcast.Trim.exe`](https://github.com/oiuy-retro/podcast-trim/
 
 **Export Opus...** asks for a folder (it starts in the last one used, saved in `configuration.conf`) and copies the trimmed episode there, for use without the feed.
 
+### NEW and OLD episodes
+
+When you add a show, only its newest episode is listed as `[NEW ]`. Every older episode that hasn't been downloaded is listed as `[OLD ]` in dimmer text, because you have usually heard those already in another app. Episodes that turn up later with **Check for new** are always NEW. How many of a new show's newest episodes count as NEW is **NEW on add** in Options (`[episodes] new-on-add` in `configuration.conf`, default 1, 0 lists them all as OLD). OLD episodes can still be downloaded and trimmed like any other.
+
+Episodes your podcast app has already downloaded (SENT) count as seen too. They keep their `[SENT ]` tag and are drawn in the same dimmer text. Mark as unseen on a SENT episode shows it at full brightness again.
+
+Right-click an episode for:
+
+- **Mark as seen** and **Mark as unseen**: the selected episode (every selected episode when several are selected).
+- **Mark older as seen** and **Mark older as unseen**: every episode below the one you clicked, that is, older than it.
+
+Libraries from version 0.1.1 and earlier have no seen marks. The first time 0.1.2 starts, it applies the same rule once to every show already in the list: the newest episode of each (or **NEW on add** of them) stays NEW and the older not-downloaded ones become OLD. Before that it copies `library.json` to `library-before-0.1.2.json` in the same folder. Episodes that were already SENT are marked seen at the same time. Nothing else in the library changes, and the status line says how many episodes were marked. To undo it for a show, right-click its newest episode and pick **Mark older as unseen**.
+
+### Bulk AI prompt
+
+**Bulk prompt...** opens a list of every transcribed episode that is waiting for cuts, from all shows. Tick up to three (**Bulk prompt size** in Options, `[prompt] bulk-size` in `configuration.conf`, 1 to 20) and press **Copy prompt**. The prompt holds every ticked episode's transcript, each under its own `hash:` header line. Paste it into your AI, paste the AI's whole reply into the reply box, and press **Check cuts**: each episode's ranges are matched to it by hash and checked against its own length, and Details lists them. **Approve and cut** then cuts them one after another. Keep the number small; AIs get less careful with very long prompts.
+
 ## AI reply format
 
-One ad per line, start and end separated by a hyphen:
+The reply starts with the episode's audio hash, then one ad per line, start and end separated by a hyphen:
 
 ```
+hash: 1a2b3c4d5e6f
 00:00:00.000-00:00:42.500
 00:23:10.120-00:25:01.900
 ```
+
+The audio hash is the first 12 hex digits of the SHA-256 of the episode's original download, shown in Details. The prompt gives it to the AI. **Check cuts** and **Approve and cut** apply a reply with one `hash:` line to the transcribed episode that hash names, even if a different episode is selected, or none is. Details and the status line then say `Cuts are for: <show> - <episode>`, and that episode is selected in the list. The reply is refused only when the hash is missing or does not belong to a transcribed episode in the library. There is no override; if you are sure, edit the hash line in the reply box.
+
+A reply to a bulk prompt has one `hash:` line per episode, each followed by that episode's ranges or `NONE`:
+
+```
+hash: 1a2b3c4d5e6f
+00:00:00.000-00:00:42.500
+hash: 0f9e8d7c6b5a
+NONE
+```
+
+If any hash in it doesn't belong to a transcribed episode, or any episode's ranges don't fit it, the whole reply is refused and nothing is cut. A reply with one hash line is matched the same way, whether or not an episode is selected.
 
 `MM:SS.mmm` and plain seconds (`12.5-40`) are also accepted, as is a line `NONE` for no ads. Blank lines, lines starting with `#`, and Markdown code fences are ignored. JSON is also accepted:
 
@@ -57,23 +88,23 @@ Trimmed episodes are Ogg Opus (`.opus`, encoded with libopus, variable bitrate).
 
 **Channels.** A mono source is encoded mono. For a stereo source, three 10-second samples (at 15%, 50% and 85% of the episode) are checked: if the difference between the channels (L-R) is at least 30 dB quieter than their sum (L+R), the two channels are the same and the episode is encoded mono. Real stereo is usually only 6 to 20 dB quieter; mono saved as stereo is 40 dB or more. Channels can also be set to Mono or Stereo.
 
-**Bitrate.** The stereo bitrate comes from this table. Low-bitrate sources get lower tiers than Opus Convert uses, because Opus is about as good at 48k as MP3 is at 64k, so a trimmed file is never needlessly bigger than its source. From 129k up the tiers are the same as Opus Convert's.
+**Bitrate.** Auto follows the source, then stays at or above 96 kbps stereo and 64 kbps mono. Those floors are there so the file still sounds all right when a podcast app plays it at 2× or faster. Above 128 kbps the rate steps up with the source.
 
 | Source | Stereo Opus bitrate |
 | --- | --- |
-| MP3/WMA | ≤40 → 32k, 41–64 → 48k, 65–96 → 64k, 97–128 → 96k, 129–192 → 128k, 193–256 → 160k, 257+ → 192k |
-| AAC/Vorbis | ≤40 → 32k, 41–64 → 48k, 65–96 → 64k, 97–128 → 96k, 129–192 → 128k, 193+ → 160k |
+| MP3/WMA | ≤128 → 96k, 129–192 → 128k, 193–256 → 160k, 257+ → 192k |
+| AAC/Vorbis | ≤128 → 96k, 129–192 → 128k, 193+ → 160k |
 | AC-3 | ≤192 → 128k, 193–384 → 160k, 385+ → 192k |
 | Lossless, DTS | 192k |
-| Opus | its own bitrate, rounded up to 24, 32, 48, 64, 96, 128, 160 or 192k (cutting always re-encodes, so it can't be copied) |
+| Opus | its own bitrate, rounded up to the next tier and then up to the floor (cutting always re-encodes, so it can't be copied) |
 
-Mono uses about 60% of the stereo bitrate, rounded up, and never less than 24k:
+When the channels match, the file is mono at about 60% of the stereo rate, and never under 64k:
 
-| Stereo | 32k | 48k | 64k | 96k | 128k | 160k | 192k |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Mono | 24k | 32k | 40k | 64k | 80k | 96k | 128k |
+| Stereo | 96k | 128k | 160k | 192k |
+| --- | --- | --- | --- | --- |
+| Mono | 64k | 80k | 96k | 128k |
 
-Details shows the result, for example `Source mp3 55 kbps stereo (identical channels) → Opus 32 kbps mono (Auto)`. A fixed bitrate (6 to 256 kbit/s) can be entered instead of Auto. Settings from older versions with the **Mono** checkbox ticked become Channels: Mono. Feeds list them with the MIME type `audio/ogg`, the registered type for Ogg Opus files (RFC 7845). AntennaPod plays them through its built-in player (ExoPlayer) on Android 5 and later.
+Details shows the result, for example `Source mp3 55 kbps stereo (identical channels) → Opus 64 kbps mono (Auto)`. A fixed bitrate (6 to 256 kbit/s) can be entered instead of Auto. A typed number is used as entered, including one under the floor. Settings from older versions with the **Mono** checkbox ticked become Channels: Mono. Feeds list them with the MIME type `audio/ogg`, the registered type for Ogg Opus files (RFC 7845). AntennaPod plays them through its built-in player (ExoPlayer) on Android 5 and later.
 
 ## Run
 
@@ -112,6 +143,12 @@ whisper-model = auto
 
 [folders]
 export = E:\Podcasts
+
+[episodes]
+new-on-add = 1
+
+[prompt]
+bulk-size = 3
 ```
 
 - `auto` looks next to `Podcast Trim.exe`, then in each folder directly inside it, then in a `bin` folder inside each of those, then on PATH. A missing line means `auto`.
@@ -120,6 +157,7 @@ export = E:\Podcasts
 - `whisper-model = auto` lists every `ggml-*.bin` found the `auto` way in Options. A file path uses that model only.
 - `[folders]` holds the folder each folder picker last used. The app rewrites only that line, so your comments and other edits stay. A remembered folder that no longer exists (for example an unplugged drive) opens at its nearest parent that still exists.
 - `[window]` holds the window's position, size and whether it was maximized (`x`, `y`, `width`, `height` in screen pixels, `maximized = yes` or `no`). The app writes it when it closes, after reading the file again so edits made while it was open stay. Delete the section to open centred at the default size. A saved position that is off every screen (for example on a monitor that is no longer connected) is moved back onto the nearest one.
+- `[episodes] new-on-add` is how many of a newly added show's newest episodes are listed as NEW (default 1). `[prompt] bulk-size` is the most episodes one bulk AI prompt holds (default 3, 1 to 20). A missing or invalid value means the default. Both can also be set in Options.
 - If the folder `Podcast Trim.exe` is in can't be written to (for example under Program Files), the file is read from there and changes are saved to `%AppData%\Podcast Trim\configuration.conf` instead.
 - Unknown lines and sections are ignored.
 

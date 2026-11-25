@@ -143,6 +143,12 @@ pub struct Episode {
     pub cleaned_bytes: u64,
     #[serde(default)]
     pub served: u32,
+    /// Already seen elsewhere: a `New` episode with this set is listed as
+    /// OLD (dimmed) instead of NEW, and a `Delivered` one keeps its SENT tag
+    /// but is dimmed. Set when an episode is sent. Files from before 0.1.2
+    /// have no such field and read as `false`.
+    #[serde(default)]
+    pub seen: bool,
     /// Episode artwork URL from the source feed, passed on in the cleaned
     /// feed. Empty (and left out of library.json) when there is none.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -155,6 +161,18 @@ impl Episode {
     }
 }
 
+/// Hex digits of the audio hash that the AI prompt and reply carry.
+pub const SHORT_HASH_LEN: usize = 12;
+
+impl Record {
+    /// First 12 hex digits of the original download's SHA-256, or None when
+    /// the episode was never downloaded.
+    pub fn short_hash(&self) -> Option<&str> {
+        let h = self.sha256.get(..SHORT_HASH_LEN)?;
+        h.bytes().all(|b| b.is_ascii_hexdigit()).then_some(h)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Show {
     pub id: u32,
@@ -163,6 +181,10 @@ pub struct Show {
     /// Per-feed access token used in the feed and media URLs.
     pub token: String,
     pub episodes: Vec<Episode>,
+    /// The "only the newest few are NEW" rule has run for this show (when
+    /// it was added, or once on upgrade for shows added before 0.1.2).
+    #[serde(default)]
+    pub seen_rule_done: bool,
     /// Show artwork URL from the source feed, passed on in the cleaned feed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub image_url: String,
@@ -172,6 +194,9 @@ pub struct Show {
 pub struct Library {
     pub next_id: u32,
     pub shows: Vec<Show>,
+    /// Episodes sent before 0.1.2 have been marked seen (once).
+    #[serde(default)]
+    pub sent_seen_done: bool,
 }
 
 impl Library {
@@ -191,6 +216,7 @@ impl Library {
             feed_url,
             token: new_token(),
             episodes: Vec::new(),
+            seen_rule_done: false,
             image_url: String::new(),
         });
         id
@@ -285,6 +311,9 @@ impl Paths {
     pub fn library(&self) -> PathBuf {
         self.root.join("library.json")
     }
+    pub fn queue(&self) -> PathBuf {
+        self.root.join("queue.json")
+    }
     pub fn show_dir(&self, show: u32) -> PathBuf {
         self.root.join("shows").join(show.to_string())
     }
@@ -345,6 +374,22 @@ mod tests {
         fs::remove_file(d).unwrap();
         assert_ne!(new_token(), new_token());
         assert_eq!(new_token().len(), 32);
+    }
+
+    #[test]
+    fn short_hash() {
+        let mut r = Record::default();
+        assert_eq!(r.short_hash(), None);
+        r.sha256 = sha256_hex(b"abc");
+        assert_eq!(r.short_hash(), Some("ba7816bf8f01"));
+        r.sha256 = "not-a-hash-at-all".into();
+        assert_eq!(r.short_hash(), None);
+        // Episodes from 0.1.1 files read with `seen` off.
+        let e: Episode = serde_json::from_str(
+            r#"{"guid":"g","title":"t","pub_date":"","source_url":"","state":"New"}"#,
+        )
+        .unwrap();
+        assert!(!e.seen);
     }
 
     #[test]

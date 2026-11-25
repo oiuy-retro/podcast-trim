@@ -25,6 +25,7 @@ pub struct Shared {
     pub paths: Paths,
     pub coverage: HashMap<String, Coverage>,
     pub log: Vec<String>,
+    pub queue: crate::queue::Queue,
 }
 
 impl Shared {
@@ -36,6 +37,7 @@ impl Shared {
     }
     pub fn save(&self) {
         let _ = save_json(&self.paths.library(), &self.lib);
+        let _ = self.queue.save(&self.paths.queue());
     }
 }
 
@@ -497,6 +499,7 @@ mod tests {
             },
             cleaned_bytes: 10,
             served: 0,
+            seen: false,
             image_url: "http://x/e.jpg?a=1&b=2".into(),
         };
         lib.show_mut(id).unwrap().image_url = "http://x/s.jpg".into();
@@ -517,6 +520,7 @@ mod tests {
             paths,
             coverage: HashMap::new(),
             log: vec![],
+            queue: Default::default(),
         }));
         let addr = start(shared.clone(), Arc::new(|| {})).unwrap();
 
@@ -546,6 +550,7 @@ mod tests {
             let sh = shared.lock().unwrap();
             let e = &sh.lib.show(id).unwrap().episodes[0];
             assert_eq!(e.state, State::Delivered);
+            assert!(e.seen);
             assert!(!sh.paths.cleaned(id, e).exists());
             assert_eq!(e.record.sha256, "h");
         }
@@ -577,6 +582,7 @@ mod tests {
             },
             cleaned_bytes: 5,
             served: 0,
+            seen: false,
             image_url: img.into(),
         };
         let ep_same = make_ep("g-same", "http://x/show.jpg");
@@ -626,6 +632,7 @@ mod tests {
                 port: 0,
                 ..Default::default()
             },
+            queue: Default::default(),
             paths,
             coverage: HashMap::new(),
             log: vec![],

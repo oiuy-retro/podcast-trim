@@ -4,13 +4,14 @@
 //! The window draws its own caption, tabs, buttons, and scroll bars.
 
 use crate::net;
+use podcast_trim::config::Conf;
 use podcast_trim::cutlist::{format_time, removed_seconds, Cut};
 use podcast_trim::pipeline::{self, Env};
+use podcast_trim::queue::{self, JobId, Queue};
 use podcast_trim::server::{self, Shared, SharedRef};
 use podcast_trim::store::{self, load_json, save_json, Library, Paths, Settings, State};
-use podcast_trim::config::Conf;
 use podcast_trim::winstate::{self, WinState};
-use podcast_trim::{artwork, ffargs, prompt, refresh, rss, tools};
+use podcast_trim::{artwork, cutlist, ffargs, prompt, refresh, rss, seen, tools, transcript};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
@@ -90,6 +91,20 @@ const OPT_BASE: i32 = 300;
 
 const B_CHANNELS: i32 = 213;
 const B_MODEL: i32 = 214;
+const B_BULK: i32 = 219;
+/// Options rows for the NEW rule and the bulk prompt size (configuration.conf).
+const OPT_NEW_ON_ADD: i32 = 320;
+const OPT_BULK_SIZE: i32 = 321;
+
+/// Right-click menu on the episode list, in order.
+const SEEN_MENU: [&str; 4] = [
+    "Mark as seen",
+    "Mark as unseen",
+    "Mark older as seen",
+    "Mark older as unseen",
+];
+
+mod picker;
 
 /// Edit rows on the Options page; row 0 is the model picker button.
 const OPTION_LABELS: [&str; 7] = [
@@ -115,7 +130,9 @@ struct Ui {
     /// Cuts that passed validation, waiting for approval: (show, guid, cuts).
     pending: Option<(u32, String, Vec<Cut>)>,
     busy: bool,
-    options: bool,
+    page: u8,
+    /// Load in-progress jobs as-is and draw a fake progress state (screenshots).
+    queue_preview: bool,
     token_on: bool,
     channels: store::Channels,
     models: Vec<String>,
@@ -446,8 +463,19 @@ pub fn run() -> i32 {
         let _ = conf.set_folder("export", settings.export_dir.trim());
     }
     crate::sound::install(&conf, &tools::exe_dir());
+    let upgrade_note = upgrade_seen(&mut lib, &paths, conf.new_on_add());
     let models = tools::model_names(&conf, &tools::exe_dir());
     let saved = WinState::from_conf(&conf);
+    let queue_preview = match std::env::var("PODCAST_TRIM_QUEUE_PREVIEW") {
+        Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true"),
+        Err(_) => false,
+    };
+    let queue = if queue_preview {
+        Queue::load_as_saved(&paths.queue())
+    } else {
+        Queue::load(&paths.queue())
+    };
+    let pending_on_start = queue.pending_count();
     let shared: SharedRef = Arc::new(Mutex::new(Shared {
         lib,
         conf,
@@ -455,6 +483,7 @@ pub fn run() -> i32 {
         paths,
         coverage: HashMap::new(),
         log: Vec::new(),
+        queue,
     }));
 
     unsafe {
@@ -545,7 +574,8 @@ pub fn run() -> i32 {
             ep_guids: vec![],
             pending: None,
             busy: false,
-            options: false,
+            page: PAGE_MAIN,
+            queue_preview,
             token_on,
             channels,
             models,
@@ -604,10 +634,29 @@ pub fn run() -> i32 {
             }
             Err(e) => status(ui, &e),
         });
+        if let Some(note) = &upgrade_note {
+            with(|ui| ui.shared.lock().unwrap().note(note.clone()));
+        }
         refresh_lists();
+        if queue_preview {
+            apply_queue_preview();
+        } else if pending_on_start > 0 {
+            with(|ui| {
+                status(
+                    ui,
+                    &format!(
+                        "{} still in the queue. Press Download + transcribe to continue.",
+                        store::plural(pending_on_start, "episode")
+                    ),
+                )
+            });
+        }
         let _ = ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW });
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+            if picker::current().is_some_and(|p| IsDialogMessageW(p, &msg).as_bool()) {
+                continue;
+            }
             if IsDialogMessageW(hwnd, &msg).as_bool() {
                 continue;
             }
@@ -618,12 +667,52 @@ pub fn run() -> i32 {
     0
 }
 
+/// One-time upgrade for shows added before 0.1.2: only the newest
+/// `keep_new` episodes of each stay NEW. library.json is copied to
+/// library-before-0.1.2.json first. Returns a message for the status line.
+fn upgrade_seen(lib: &mut Library, paths: &Paths, keep_new: usize) -> Option<String> {
+    if lib.shows.iter().all(|s| s.seen_rule_done) && lib.sent_seen_done {
+        return None;
+    }
+    let mut after = lib.clone();
+    let (shows, eps) = seen::migrate(&mut after, keep_new);
+    let sent = seen::migrate_sent(&mut after);
+    if eps + sent > 0 {
+        let backup = paths.root.join("library-before-0.1.2.json");
+        if !backup.exists() && std::fs::copy(paths.library(), &backup).is_err() {
+            // Without a backup, leave the library as it is this time.
+            return None;
+        }
+    }
+    *lib = after;
+    if save_json(&paths.library(), lib).is_err() || eps + sent == 0 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if eps > 0 {
+        parts.push(format!(
+            "Listed {} in {} as OLD (already seen); only the newest {} of each show stay NEW.",
+            store::plural(eps, "older episode"),
+            store::plural(shows, "show"),
+            keep_new
+        ));
+    }
+    if sent > 0 {
+        let verb = if sent == 1 { "counts" } else { "count" };
+        parts.push(format!("{} now {verb} as seen.", store::plural(sent, "sent episode")));
+    }
+    parts.push("Right-click an episode to change this.".into());
+    Some(parts.join(" "))
+}
+
 /// The window's last restored (not maximized or minimized) screen rect.
 static NORMAL: Mutex<winstate::Rect> = Mutex::new((0, 0, 0, 0));
 
 /// Work area (left, top, right, bottom) of the monitor nearest `r`.
 unsafe fn work_area(r: winstate::Rect) -> (i32, i32, i32, i32) {
-    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
     let rc = RECT {
         left: r.0,
         top: r.1,
@@ -639,7 +728,12 @@ unsafe fn work_area(r: winstate::Rect) -> (i32, i32, i32, i32) {
         let w = mi.rcWork;
         (w.left, w.top, w.right, w.bottom)
     } else {
-        (0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
+        (
+            0,
+            0,
+            GetSystemMetrics(SM_CXSCREEN),
+            GetSystemMetrics(SM_CYSCREEN),
+        )
     }
 }
 
@@ -754,6 +848,7 @@ const LIST: u32 = LBS_NOTIFY as u32
     | LBS_DISABLENOSCROLL as u32
     | WS_VSCROLL.0
     | WS_TABSTOP.0;
+const LIST_MULTI: u32 = LIST | LBS_EXTENDEDSEL as u32;
 
 const PAGE_ALL: u8 = 0;
 const PAGE_MAIN: u8 = 1;
@@ -1077,7 +1172,7 @@ fn build_controls(instance: HINSTANCE) {
             ui,
             instance,
             l,
-            LIST,
+            LIST_MULTI,
             ID_EPS,
             m,
             Some("Episode"),
@@ -1095,8 +1190,9 @@ fn build_controls(instance: HINSTANCE) {
             150,
         );
         button(ui, instance, "Copy AI prompt", B_PROMPT, m, 456, 374, 120);
-        button(ui, instance, "Regenerate", B_REGEN, m, 300, 404, 100);
-        button(ui, instance, "Export Opus...", B_EXPORT, m, 406, 404, 110);
+        button(ui, instance, "Regenerate", B_REGEN, m, 300, 404, 90);
+        button(ui, instance, "Export Opus...", B_EXPORT, m, 396, 404, 100);
+        button(ui, instance, "Bulk prompt...", B_BULK, m, 502, 404, 94);
 
         ui.anchor = Anchor(0.65, 1.0, 0.0, 1.0);
         boxed(
@@ -1247,21 +1343,41 @@ fn build_controls(instance: HINSTANCE) {
         );
         ui.anchor = Anchor(1.0, 1.0, 0.0, 0.0);
         button(ui, instance, "Save", B_SAVE, o, 796, 72, 80);
+        // configuration.conf [episodes] new-on-add and [prompt] bulk-size.
+        let (keep_new, bulk) = {
+            let sh = ui.shared.lock().unwrap();
+            (sh.conf.new_on_add(), sh.conf.bulk_size())
+        };
+        for (i, (text, id, v)) in [
+            ("NEW on add", OPT_NEW_ON_ADD, keep_new),
+            ("Bulk prompt size", OPT_BULK_SIZE, bulk),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let y = 104 + i as i32 * 32;
+            label(ui, text, o, 668, y + 4, 140);
+            let h = field(ui, instance, EDIT, id, o, (816, y, 60, 22));
+            set_text(h, &v.to_string());
+        }
         ui.anchor = FIXED;
     });
-    set_page(false);
+    set_page(PAGE_MAIN);
     update_buttons();
 }
 
-fn set_page(options: bool) {
+fn set_page(page: u8) {
     with(|ui| unsafe {
-        ui.options = options;
+        ui.page = page;
         for (h, p) in &ui.pages {
-            let show = *p == PAGE_ALL || (*p == PAGE_OPT) == options;
+            let show = *p == PAGE_ALL || *p == page;
             let _ = ShowWindow(*h, if show { SW_SHOW } else { SW_HIDE });
         }
-        let _ = InvalidateRect(ui.ctl[&B_TAB_MAIN], None, true);
-        let _ = InvalidateRect(ui.ctl[&B_TAB_OPT], None, true);
+        for id in [B_TAB_MAIN, B_TAB_OPT] {
+            if let Some(h) = ui.ctl.get(&id) {
+                let _ = InvalidateRect(*h, None, true);
+            }
+        }
         let _ = InvalidateRect(ui.hwnd, None, true);
     });
 }
@@ -1277,6 +1393,43 @@ fn current(ui: &Ui) -> (Option<u32>, Option<String>) {
     (show, ep)
 }
 
+/// List tag for an episode: OLD for one marked as already seen. A sent
+/// episode keeps SENT whether or not it is seen; only the dimming differs.
+fn episode_tag(e: &store::Episode) -> &'static str {
+    match seen::mark(e) {
+        seen::Mark::Old => "OLD  ",
+        _ => state_tag(e.state),
+    }
+}
+
+/// Item data 1 draws a list row dimmed (see `draw_list_item`).
+fn set_dimmed(h: HWND, dim: &[bool]) {
+    for (i, d) in dim.iter().enumerate() {
+        unsafe {
+            SendMessageW(h, LB_SETITEMDATA, WPARAM(i), LPARAM(*d as isize));
+        }
+    }
+}
+
+/// The selected episodes: every selected row in a multi-select list,
+/// otherwise the one current row.
+fn selected_guids(ui: &Ui) -> Vec<String> {
+    let h = ui.ctl[&ID_EPS];
+    unsafe {
+        let style = GetWindowLongW(h, GWL_STYLE) as u32;
+        if style & (LBS_EXTENDEDSEL as u32 | LBS_MULTIPLESEL as u32) != 0 {
+            let n = SendMessageW(h, LB_GETSELCOUNT, WPARAM(0), LPARAM(0)).0.max(0) as usize;
+            let mut idx = vec![0i32; n];
+            let got = SendMessageW(h, LB_GETSELITEMS, WPARAM(n), LPARAM(idx.as_mut_ptr() as isize)).0.max(0) as usize;
+            return idx[..got.min(n)]
+                .iter()
+                .filter_map(|i| ui.ep_guids.get(*i as usize).cloned())
+                .collect();
+        }
+    }
+    current(ui).1.into_iter().collect()
+}
+
 fn state_tag(s: State) -> &'static str {
     match s {
         State::New => "NEW  ",
@@ -1289,7 +1442,44 @@ fn state_tag(s: State) -> &'static str {
 
 /// Fill a list; an empty list is hidden so its clip parent shows
 /// `empty` instead, like "No players are currently connected to the server."
-fn fill_list(h: HWND, items: &[String], keep: Option<usize>, empty: &str) {
+fn list_is_multi(h: HWND) -> bool {
+    unsafe { GetWindowLongW(h, GWL_STYLE) as u32 & LBS_EXTENDEDSEL as u32 != 0 }
+}
+
+fn selected_indices(h: HWND) -> Vec<usize> {
+    unsafe {
+        if list_is_multi(h) {
+            let n = SendMessageW(h, LB_GETSELCOUNT, WPARAM(0), LPARAM(0)).0;
+            if n <= 0 {
+                return Vec::new();
+            }
+            let mut idx = vec![0i32; n as usize];
+            let got = SendMessageW(
+                h,
+                LB_GETSELITEMS,
+                WPARAM(n as usize),
+                LPARAM(idx.as_mut_ptr() as isize),
+            )
+            .0;
+            if got <= 0 {
+                return Vec::new();
+            }
+            idx.into_iter()
+                .take(got as usize)
+                .filter_map(|i| (i >= 0).then_some(i as usize))
+                .collect()
+        } else {
+            selected_hwnd(h).into_iter().collect()
+        }
+    }
+}
+
+fn selected_hwnd(h: HWND) -> Option<usize> {
+    let i = unsafe { SendMessageW(h, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0 };
+    (i >= 0).then_some(i as usize)
+}
+
+fn fill_list(h: HWND, items: &[String], keep: &[usize], empty: &str) {
     unsafe {
         if let Ok(clip) = GetParent(h) {
             let w = wide(if items.is_empty() { empty } else { "" });
@@ -1303,12 +1493,70 @@ fn fill_list(h: HWND, items: &[String], keep: Option<usize>, empty: &str) {
             let w = wide(it);
             SendMessageW(h, LB_ADDSTRING, WPARAM(0), LPARAM(w.as_ptr() as isize));
         }
-        if let Some(k) = keep.filter(|k| *k < items.len()) {
+        let keep: Vec<usize> = keep.iter().copied().filter(|k| *k < items.len()).collect();
+        if list_is_multi(h) {
+            for k in &keep {
+                SendMessageW(h, LB_SETSEL, WPARAM(1), LPARAM(*k as isize));
+            }
+            if let Some(&c) = keep.last() {
+                SendMessageW(h, LB_SETCARETINDEX, WPARAM(c), LPARAM(0));
+            }
+        } else if let Some(&k) = keep.first() {
             SendMessageW(h, LB_SETCURSEL, WPARAM(k), LPARAM(0));
         }
         SendMessageW(h, WM_SETREDRAW, WPARAM(1), LPARAM(0));
         let _ = InvalidateRect(h, None, true);
     }
+}
+
+fn episode_label(show: u32, e: &store::Episode, queue: &Queue) -> String {
+    let tag = queue
+        .get(&JobId {
+            show,
+            guid: e.guid.clone(),
+        })
+        .and_then(|j| j.status.list_tag())
+        .unwrap_or(episode_tag(e));
+    format!("[{tag}] {}", e.title)
+}
+
+fn apply_queue_preview() {
+    with(|ui| unsafe {
+        ui.busy = true;
+        let (active, extras) = {
+            let sh = ui.shared.lock().unwrap();
+            let active = sh.queue.active().map(|j| j.id.guid.clone());
+            let extras: Vec<String> = sh
+                .queue
+                .jobs()
+                .iter()
+                .filter(|j| j.status == queue::JobStatus::Queued)
+                .take(2)
+                .map(|j| j.id.guid.clone())
+                .collect();
+            let line = sh
+                .queue
+                .status_line("Transcribing", 35)
+                .unwrap_or_else(|| "Queue preview".into());
+            status(ui, &line);
+            (active, extras)
+        };
+        let h = ui.ctl[&ID_EPS];
+        SendMessageW(h, LB_SETSEL, WPARAM(0), LPARAM(-1));
+        for g in active.into_iter().chain(extras) {
+            if let Some(i) = ui.ep_guids.iter().position(|x| *x == g) {
+                SendMessageW(h, LB_SETSEL, WPARAM(1), LPARAM(i as isize));
+                SendMessageW(h, LB_SETCARETINDEX, WPARAM(i), LPARAM(0));
+            }
+        }
+        if let Some(&h) = ui.ctl.get(&ID_PROGRESS) {
+            let _ = InvalidateRect(h, None, false);
+        }
+    });
+    PROGRESS.store(350, std::sync::atomic::Ordering::Relaxed);
+    *STAGE.lock().unwrap() = "Transcribing".into();
+    show_details();
+    update_buttons();
 }
 
 fn feed_link(ui: &Ui, sh: &Shared, id: u32) -> String {
@@ -1338,9 +1586,15 @@ fn feed_link(ui: &Ui, sh: &Shared, id: u32) -> String {
 }
 
 fn refresh_lists() {
+    refresh_lists_keep(None);
+}
+
+/// Rebuild the lists, optionally selecting `keep_guid` (after the show list
+/// already points at that episode's show).
+fn refresh_lists_keep(keep_guid: Option<&str>) {
     with(|ui| {
         let keep_show = selected(ui, ID_SHOWS);
-        let keep_ep = selected(ui, ID_EPS);
+        let keep_ep = selected_indices(ui.ctl[&ID_EPS]);
         let sh = ui.shared.lock().unwrap();
         ui.show_ids = sh.lib.shows.iter().map(|s| s.id).collect();
         let names: Vec<String> = sh
@@ -1365,39 +1619,46 @@ fn refresh_lists() {
             })
             .collect();
         let keep_show = keep_show.or(if names.is_empty() { None } else { Some(0) });
+        let keep_show_v: Vec<usize> = keep_show.into_iter().collect();
         fill_list(
             ui.ctl[&ID_SHOWS],
             &names,
-            keep_show,
+            &keep_show_v,
             "No shows yet. Paste a show's RSS link below and press Add show.",
         );
-        let show = keep_show
-            .and_then(|i| ui.show_ids.get(i))
-            .and_then(|id| sh.lib.show(*id));
+        let show_id = keep_show_v
+            .first()
+            .and_then(|i| ui.show_ids.get(*i).copied());
+        let show = show_id.and_then(|id| sh.lib.show(id));
         let (eps, guids): (Vec<String>, Vec<String>) = show
             .map(|s| {
                 s.episodes
                     .iter()
-                    .map(|e| {
-                        (
-                            format!("[{}] {}", state_tag(e.state), e.title),
-                            e.guid.clone(),
-                        )
-                    })
+                    .map(|e| (episode_label(s.id, e, &sh.queue), e.guid.clone()))
                     .unzip()
             })
             .unwrap_or_default();
-        ui.ep_guids = guids;
+        let dim: Vec<bool> = show
+            .map(|s| s.episodes.iter().map(seen::dimmed).collect())
+            .unwrap_or_default();
         let none = if show.is_some() {
             "This show has no episodes yet."
         } else {
             "No show is selected."
         };
-        fill_list(ui.ctl[&ID_EPS], &eps, keep_ep, none);
+        let keep_ep: Vec<usize> = match keep_guid {
+            Some(g) => guids.iter().position(|x| x == g).into_iter().collect(),
+            None => keep_ep,
+        };
+        ui.ep_guids = guids;
+        fill_list(ui.ctl[&ID_EPS], &eps, &keep_ep, none);
+        set_dimmed(ui.ctl[&ID_EPS], &dim);
         let link = show.map(|s| feed_link(ui, &sh, s.id)).unwrap_or_default();
         set_text(ui.ctl[&ID_FEED], &link);
-        if let Some(last) = sh.log.last() {
-            set_text(ui.ctl[&ID_STATUS], last);
+        if !ui.busy {
+            if let Some(last) = sh.log.last() {
+                set_text(ui.ctl[&ID_STATUS], last);
+            }
         }
     });
     show_details();
@@ -1430,6 +1691,7 @@ fn show_details() {
                     t.push_str(&format!("{}\n", source_line(e, &sh.settings)));
                 }
                 match e.state {
+                    State::New if e.seen => t.push_str("\nNot downloaded yet. Marked as already seen (OLD); right-click to mark it unseen."),
                     State::New => t.push_str("\nNot downloaded yet."),
                     State::Downloaded => t.push_str("\nDownloaded. Press Download + transcribe to transcribe."),
                     State::Transcribed => t.push_str("\nTranscribed. Copy the AI prompt, paste it into your AI, then paste its reply below and press Check cuts."),
@@ -1440,11 +1702,14 @@ fn show_details() {
                         ));
                         for c in &e.record.cuts {
                             t.push_str(&format!("  {} - {}\n", format_time(c.start), format_time(c.end)));
+                            append_cut_words(&mut t, &e.record.transcript, c.start, c.end);
                         }
                         t.push_str(if e.state == State::Ready {
                             "\nIn the feed. It is deleted after one full download."
+                        } else if e.seen {
+                            "\nSent: downloaded once by your podcast app and deleted. It counts as seen; right-click to mark it unseen. Regenerate to put it back in the feed."
                         } else {
-                            "\nDownloaded once and deleted. Regenerate to put it back in the feed."
+                            "\nSent: downloaded once by your podcast app and deleted. Regenerate to put it back in the feed."
                         });
                     }
                 }
@@ -1452,13 +1717,25 @@ fn show_details() {
             }
         };
         drop(sh);
-        if ui.pending.is_none() {
+        if ui.pending.is_none() && !bulk_pending() {
             set_text(ui.ctl[&ID_VIEW], &text);
         }
     });
 }
 
-/// e.g. "Source mp3 55 kbps stereo (identical channels) -> Opus 32 kbps mono (Auto)".
+/// Words from the transcript that overlap a cut, indented under its times.
+fn append_cut_words(t: &mut String, transcript: &str, start: f64, end: f64) {
+    let words = transcript::text_in_range(transcript, start, end);
+    t.push_str("  ");
+    if words.is_empty() {
+        t.push_str("(no transcript text in this range)");
+    } else {
+        t.push_str(&words);
+    }
+    t.push('\n');
+}
+
+/// e.g. "Source mp3 55 kbps stereo (identical channels) -> Opus 64 kbps mono (Auto)".
 fn source_line(e: &store::Episode, s: &Settings) -> String {
     let r = &e.record;
     let mut src = r.codec.clone();
@@ -1500,22 +1777,40 @@ fn update_buttons() {
             .and_then(|s| sh.lib.show(s))
             .and_then(|s| s.episodes.iter().find(|e| Some(&e.guid) == guid.as_ref()))
             .map(|e| e.state);
+        let any_transcribed = sh
+            .lib
+            .shows
+            .iter()
+            .flat_map(|s| &s.episodes)
+            .any(|e| e.state == State::Transcribed && e.record.short_hash().is_some());
+        let selected_eligible = {
+            selected_indices(ui.ctl[&ID_EPS]).iter().any(|&i| {
+                ui.ep_guids
+                    .get(i)
+                    .and_then(|g| {
+                        show.and_then(|s| sh.lib.show(s))
+                            .and_then(|s| s.episodes.iter().find(|e| e.guid == *g))
+                    })
+                    .is_some_and(|e| Queue::can_enqueue(e.state))
+            })
+        };
+        let pending = sh.queue.pending_count();
         drop(sh);
         let idle = !ui.busy;
         let en = |id: i32, on: bool| {
-            let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(ui.ctl[&id], on);
+            if let Some(h) = ui.ctl.get(&id) {
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(*h, on);
+            }
         };
         en(B_ADD, idle);
         en(B_REFRESH, idle && !ui.show_ids.is_empty());
-        en(
-            B_PROCESS,
-            idle && matches!(st, Some(State::New | State::Downloaded)),
-        );
+        en(B_PROCESS, selected_eligible || (idle && pending > 0));
         en(B_PROMPT, st == Some(State::Transcribed));
-        en(B_CHECK, st == Some(State::Transcribed));
+        en(B_BULK, any_transcribed);
+        en(B_CHECK, any_transcribed);
         en(
             B_APPROVE,
-            idle && ui.pending.is_some() && st == Some(State::Transcribed),
+            idle && (bulk_pending() || ui.pending.is_some() && st == Some(State::Transcribed)),
         );
         en(B_REGEN, idle && st == Some(State::Delivered));
         en(B_EXPORT, idle && st == Some(State::Ready));
@@ -1544,6 +1839,156 @@ fn update_buttons() {
         let mw = wide(&model);
         let _ = SetWindowTextW(ui.ctl[&B_MODEL], PCWSTR(mw.as_ptr()));
     });
+}
+
+thread_local! {
+    /// The episode the right-click menu was opened on.
+    static MENU_EP: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Cuts from a checked reply covering several episodes, waiting for approval.
+    static BULK: RefCell<Vec<pipeline::BulkCut>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Progress for one episode of a bulk cut: "Cutting 2 of 3: Title".
+struct Labeled<'a>(&'a str);
+
+impl Env for Labeled<'_> {
+    fn fetch(&self, url: &str, dest: &Path) -> Result<(), String> {
+        SysEnv.fetch(url, dest)
+    }
+    fn run(&self, program: &str, args: &[String]) -> Result<String, String> {
+        SysEnv.run(program, args)
+    }
+    fn run_watch(&self, program: &str, args: &[String], line: &mut dyn FnMut(&str)) -> Result<String, String> {
+        SysEnv.run_watch(program, args, line)
+    }
+    fn progress(&self, _stage: &str, fraction: f64) {
+        set_progress(self.0, fraction);
+    }
+}
+
+/// Select this episode in the lists so Details and Approve and cut follow it.
+fn select_episode(show: u32, guid: &str) {
+    with(|ui| unsafe {
+        if let Some(i) = ui.show_ids.iter().position(|&id| id == show) {
+            SendMessageW(ui.ctl[&ID_SHOWS], LB_SETCURSEL, WPARAM(i), LPARAM(0));
+        }
+    });
+    refresh_lists_keep(Some(guid));
+}
+
+/// Details text for a checked bulk reply.
+fn bulk_summary(list: &[pipeline::BulkCut]) -> String {
+    let mut t = format!("Cut lists for {}:\n", store::plural(list.len(), "episode"));
+    for b in list {
+        t.push_str(&format!(
+            "\n{}\n  {} cut(s), {} removed\n",
+            b.title,
+            b.cuts.len(),
+            format_time(removed_seconds(&b.cuts))
+        ));
+        for c in &b.cuts {
+            t.push_str(&format!("  {} - {}\n", format_time(c.start), format_time(c.end)));
+        }
+    }
+    t.push_str("\nPress Approve and cut to cut them all, one after another.");
+    t
+}
+
+fn bulk_pending() -> bool {
+    BULK.with(|b| !b.borrow().is_empty())
+}
+
+/// Right-click on the episode list: select the row under the pointer (unless
+/// it is already part of the selection) and open the seen/unseen menu.
+unsafe fn episode_menu(lp: LPARAM) {
+    let Some((list, busy)) = with(|ui| (ui.ctl[&ID_EPS], ui.busy)) else {
+        return;
+    };
+    if busy || !IsWindowVisible(list).as_bool() {
+        return;
+    }
+    let mut pt = windows::Win32::Foundation::POINT {
+        x: (lp.0 & 0xffff) as i16 as i32,
+        y: ((lp.0 >> 16) & 0xffff) as i16 as i32,
+    };
+    let keyboard = pt.x == -1 && pt.y == -1;
+    // wParam names the clicked window, but which one varies (the list or
+    // its clip parent), so test the point against the list instead.
+    let mut lr = RECT::default();
+    let _ = GetWindowRect(list, &mut lr);
+    let on_list = pt.x >= lr.left && pt.x < lr.right && pt.y >= lr.top && pt.y < lr.bottom;
+    if keyboard && windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() != list || !keyboard && !on_list {
+        return;
+    }
+    let row = if keyboard {
+        let cur = SendMessageW(list, LB_GETCARETINDEX, WPARAM(0), LPARAM(0)).0;
+        let mut r = RECT::default();
+        if cur < 0 || SendMessageW(list, LB_GETITEMRECT, WPARAM(cur as usize), LPARAM(&mut r as *mut _ as isize)).0 < 0 {
+            return;
+        }
+        pt = windows::Win32::Foundation::POINT { x: r.left + 20, y: r.bottom };
+        let _ = windows::Win32::Graphics::Gdi::ClientToScreen(list, &mut pt);
+        cur as usize
+    } else {
+        let mut c = pt;
+        let _ = windows::Win32::Graphics::Gdi::ScreenToClient(list, &mut c);
+        let hit = SendMessageW(list, LB_ITEMFROMPOINT, WPARAM(0), LPARAM(((c.y as isize & 0xffff) << 16) | (c.x as isize & 0xffff))).0;
+        if (hit >> 16) & 0xffff != 0 {
+            return; // below the last row
+        }
+        (hit & 0xffff) as usize
+    };
+    let selected = SendMessageW(list, LB_GETSEL, WPARAM(row), LPARAM(0)).0 > 0;
+    if !selected {
+        let multi = GetWindowLongW(list, GWL_STYLE) as u32
+            & (LBS_EXTENDEDSEL as u32 | LBS_MULTIPLESEL as u32)
+            != 0;
+        if multi {
+            SendMessageW(list, LB_SETSEL, WPARAM(0), LPARAM(-1));
+            SendMessageW(list, LB_SETSEL, WPARAM(1), LPARAM(row as isize));
+        } else {
+            SendMessageW(list, LB_SETCURSEL, WPARAM(row), LPARAM(0));
+        }
+        on_command(ID_EPS, LBN_SELCHANGE);
+    }
+    let guid = with(|ui| ui.ep_guids.get(row).cloned()).flatten();
+    if guid.is_none() {
+        return;
+    }
+    MENU_EP.with(|m| *m.borrow_mut() = guid);
+    open_menu(pt.x, pt.y, ID_EPS, SEEN_MENU.iter().map(|s| s.to_string()).collect());
+}
+
+/// A pick from `SEEN_MENU`.
+fn seen_menu_pick(item: usize) {
+    let Some(clicked) = MENU_EP.with(|m| m.borrow_mut().take()) else {
+        return;
+    };
+    with(|ui| {
+        let Some(show) = current(ui).0 else {
+            return;
+        };
+        let picked = selected_guids(ui);
+        let mut sh = ui.shared.lock().unwrap();
+        let Some(s) = sh.lib.show_mut(show) else {
+            return;
+        };
+        let (n, what) = match item {
+            0 => (seen::set(s, &picked, true), "seen"),
+            1 => (seen::set(s, &picked, false), "unseen"),
+            2 => (seen::set_older(s, &clicked, true), "seen"),
+            3 => (seen::set_older(s, &clicked, false), "unseen"),
+            _ => return,
+        };
+        let msg = if n == 0 {
+            format!("Nothing to change: those episodes are already marked {what}.")
+        } else {
+            format!("Marked {} as {what}.", store::plural(n, "episode"))
+        };
+        sh.note(msg);
+        sh.save();
+    });
+    refresh_lists();
 }
 
 /// Run `job` on a worker thread with the shared state, then refresh.
@@ -1598,7 +2043,12 @@ fn episode_job(
                 .and_then(|s| s.episodes.iter().find(|e| e.guid == guid))
                 .cloned()
                 .ok_or("episode is gone")?;
-            (sh.settings.clone(), sh.conf.clone(), sh.paths.root.clone(), ep)
+            (
+                sh.settings.clone(),
+                sh.conf.clone(),
+                sh.paths.root.clone(),
+                ep,
+            )
         };
         let settings = tools::resolve(&settings, &conf, &tools::exe_dir())?;
         let paths = Paths::new(root);
@@ -1618,15 +2068,236 @@ fn episode_job(
     }
 }
 
+fn post_refresh(hraw: isize, done: bool) {
+    unsafe {
+        let _ = PostMessageW(
+            HWND(hraw as _),
+            WM_REFRESH,
+            WPARAM(if done { 1 } else { 0 }),
+            LPARAM(0),
+        );
+    }
+}
+
+fn write_episode(shared: &SharedRef, show: u32, guid: &str, ep: store::Episode) {
+    let mut sh = shared.lock().unwrap();
+    if let Some(slot) = sh
+        .lib
+        .show_mut(show)
+        .and_then(|s| s.episodes.iter_mut().find(|e| e.guid == guid))
+    {
+        *slot = ep;
+    }
+    sh.save();
+}
+
+fn set_job_status(shared: &SharedRef, id: &JobId, status: queue::JobStatus) {
+    let mut sh = shared.lock().unwrap();
+    sh.queue.set_status(id, status);
+    let _ = sh.queue.save(&sh.paths.queue());
+}
+
+fn process_queue_job(shared: &SharedRef, show: u32, guid: String) -> Result<String, String> {
+    let (settings, conf, root, mut ep) = {
+        let sh = shared.lock().unwrap();
+        let ep = sh
+            .lib
+            .show(show)
+            .and_then(|s| s.episodes.iter().find(|e| e.guid == guid))
+            .cloned()
+            .ok_or("That episode is gone.")?;
+        (
+            sh.settings.clone(),
+            sh.conf.clone(),
+            sh.paths.root.clone(),
+            ep,
+        )
+    };
+    if !Queue::can_enqueue(ep.state) && ep.state != State::Transcribed {
+        return Err("This episode has already been transcribed.".into());
+    }
+    if ep.state == State::Transcribed {
+        return Ok(format!("{} is already transcribed.", ep.title));
+    }
+    let settings = tools::resolve(&settings, &conf, &tools::exe_dir())?;
+    let paths = Paths::new(root);
+    let id = JobId {
+        show,
+        guid: guid.clone(),
+    };
+    let title = ep.title.clone();
+    let result = (|| {
+        if ep.state == State::New {
+            set_job_status(shared, &id, queue::JobStatus::Downloading);
+            pipeline::download(&SysEnv, &settings, &paths, show, &mut ep)?;
+            if cancelled() {
+                return Err(CANCELLED.into());
+            }
+        }
+        set_job_status(shared, &id, queue::JobStatus::Transcribing);
+        pipeline::transcribe(&SysEnv, &settings, &paths, show, &mut ep)?;
+        Ok(format!("Transcribed {}. Press Copy AI prompt.", title))
+    })();
+    write_episode(shared, show, &guid, ep);
+    result
+}
+
+/// Start the worker if the queue has pending jobs and nothing is already running.
+fn start_queue() {
+    if with(|ui| ui.busy || ui.queue_preview).unwrap_or(true) {
+        return;
+    }
+    if with(|ui| ui.shared.lock().unwrap().queue.is_idle()).unwrap_or(true) {
+        return;
+    }
+    background("Working through the queue", move |shared| {
+        let hraw = MAIN.load(std::sync::atomic::Ordering::Relaxed);
+        let mut last = String::new();
+        loop {
+            if cancelled() {
+                let mut sh = shared.lock().unwrap();
+                sh.queue.cancel_all_pending();
+                sh.save();
+                break;
+            }
+            let job = {
+                let mut sh = shared.lock().unwrap();
+                let j = sh.queue.begin_next().cloned();
+                let _ = sh.queue.save(&sh.paths.queue());
+                j
+            };
+            let Some(job) = job else {
+                break;
+            };
+            post_refresh(hraw, false);
+            match process_queue_job(shared, job.id.show, job.id.guid.clone()) {
+                Ok(m) => {
+                    set_job_status(shared, &job.id, queue::JobStatus::Done);
+                    last = m;
+                }
+                Err(e) if e == CANCELLED => {
+                    let mut sh = shared.lock().unwrap();
+                    sh.queue.cancel_all_pending();
+                    sh.save();
+                    break;
+                }
+                Err(e) => {
+                    set_job_status(shared, &job.id, queue::JobStatus::Failed(e.clone()));
+                    last = format!(
+                        "Error on {}: {e}. Continuing with the next episode.",
+                        job.title
+                    );
+                }
+            }
+            post_refresh(hraw, false);
+        }
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
+        let (done, failed, leftover) = {
+            let sh = shared.lock().unwrap();
+            (
+                sh.queue.done_count(),
+                sh.queue.failed_count(),
+                sh.queue.queued_count(),
+            )
+        };
+        if done + failed <= 1 && leftover == 0 && !last.is_empty() {
+            Ok(last)
+        } else {
+            Ok(format!(
+                "Queue finished: {} transcribed, {} failed.",
+                done, failed
+            ))
+        }
+    });
+}
+
+fn enqueue_selected_and_run() {
+    let msg = with(|ui| {
+        let show = selected(ui, ID_SHOWS).and_then(|i| ui.show_ids.get(i).copied());
+        let Some(show) = show else {
+            return "Pick a show first.".to_string();
+        };
+        let guids: Vec<String> = selected_indices(ui.ctl[&ID_EPS])
+            .into_iter()
+            .filter_map(|i| ui.ep_guids.get(i).cloned())
+            .collect();
+        let mut sh = ui.shared.lock().unwrap();
+        let Some(s) = sh.lib.show(show) else {
+            return "That show is gone.".to_string();
+        };
+        let show_title = if s.title.is_empty() {
+            s.feed_url.clone()
+        } else {
+            s.title.clone()
+        };
+        let items: Vec<_> = if guids.is_empty() {
+            Vec::new()
+        } else {
+            guids
+                .iter()
+                .filter_map(|g| {
+                    s.episodes.iter().find(|e| e.guid == *g).map(|e| {
+                        (
+                            JobId {
+                                show,
+                                guid: e.guid.clone(),
+                            },
+                            e.title.clone(),
+                            show_title.clone(),
+                            e.state,
+                        )
+                    })
+                })
+                .collect()
+        };
+        let (added, skipped) = if items.is_empty() {
+            (0, 0)
+        } else {
+            sh.queue.add_many(items)
+        };
+        sh.save();
+        let pending = sh.queue.pending_count();
+        if added == 0 && pending == 0 {
+            if skipped > 0 {
+                "Those episodes are already transcribed or already in the queue.".into()
+            } else {
+                "Pick one or more episodes, then press Download + transcribe.".into()
+            }
+        } else if added == 0 {
+            format!(
+                "{} already in the queue. Press Download + transcribe to continue.",
+                store::plural(pending, "episode")
+            )
+        } else if ui.busy {
+            format!(
+                "Added {} to the queue ({} waiting).",
+                store::plural(added, "episode"),
+                pending
+            )
+        } else {
+            format!("Queued {}.", store::plural(added, "episode"))
+        }
+    });
+    if let Some(msg) = msg {
+        with(|ui| status(ui, &msg));
+    }
+    refresh_lists();
+    start_queue();
+}
+
 fn on_command(id: i32, code: u32) {
     if code == LBN_SELCHANGE {
         if id == ID_SHOWS {
             with(|ui| unsafe {
+                SendMessageW(ui.ctl[&ID_EPS], LB_SETSEL, WPARAM(0), LPARAM(-1));
                 SendMessageW(ui.ctl[&ID_EPS], LB_SETCURSEL, WPARAM(usize::MAX), LPARAM(0));
             });
             refresh_lists();
         }
         with(|ui| ui.pending = None);
+        BULK.with(|b| b.borrow_mut().clear());
         show_details();
         update_buttons();
         return;
@@ -1655,26 +2326,35 @@ fn on_command(id: i32, code: u32) {
             background("Reading feed", move |shared| {
                 let xml = net::get(&url)?;
                 let feed = rss::parse(&String::from_utf8_lossy(&xml))?;
-                let (n, item, paths) = {
+                let (n, old, item, paths) = {
                     let mut sh = shared.lock().unwrap();
                     if sh.lib.shows.iter().any(|s| s.feed_url == url) {
                         return Err("That show is already in the list.".into());
                     }
+                    let keep_new = sh.conf.new_on_add();
                     let id = sh.lib.add_show(feed.title.clone(), url);
                     let show = sh.lib.show_mut(id).unwrap();
                     let n = pipeline::merge_feed(show, &feed);
+                    let old = seen::apply_rule(show, keep_new);
                     (
                         n,
+                        old,
                         artwork::collect_show_urls(show, 10),
                         Paths::new(sh.paths.root.clone()),
                     )
                 };
                 artwork::sync_show_item(&paths, &item, &net::get);
-                Ok(format!(
-                    "Added {} with {}.",
-                    feed.title,
-                    store::plural(n, "episode")
-                ))
+                Ok(if old == 0 {
+                    format!("Added {} with {}.", feed.title, store::plural(n, "episode"))
+                } else {
+                    format!(
+                        "Added {} with {}: the newest {} NEW, {} OLD (already seen).",
+                        feed.title,
+                        store::plural(n, "episode"),
+                        n - old,
+                        old
+                    )
+                })
             });
             with(|ui| set_text(ui.ctl[&ID_URL], ""));
         }
@@ -1688,7 +2368,11 @@ fn on_command(id: i32, code: u32) {
                     .shows
                     .iter()
                     .map(|s| {
-                        let name = if s.title.trim().is_empty() { &s.feed_url } else { &s.title };
+                        let name = if s.title.trim().is_empty() {
+                            &s.feed_url
+                        } else {
+                            &s.title
+                        };
                         (s.id, name.clone(), s.feed_url.clone())
                     })
                     .collect();
@@ -1710,24 +2394,14 @@ fn on_command(id: i32, code: u32) {
                     };
                     artwork::sync_shows(&paths, &items, 4, &net::get, &cancelled);
                 }
-                Ok(refresh::summary(&out, targets.len(), out.len() < targets.len()))
+                Ok(refresh::summary(
+                    &out,
+                    targets.len(),
+                    out.len() < targets.len(),
+                ))
             });
         }
-        B_PROCESS => {
-            let (Some(show), Some(guid)) = (show, guid) else {
-                return;
-            };
-            background(
-                "Downloading and transcribing (this takes a while on the CPU)",
-                episode_job(show, guid, move |s, p, ep| {
-                    if ep.state == State::New {
-                        pipeline::download(&SysEnv, s, p, show, ep)?;
-                    }
-                    pipeline::transcribe(&SysEnv, s, p, show, ep)?;
-                    Ok(format!("Transcribed {}. Press Copy AI prompt.", ep.title))
-                }),
-            );
-        }
+        B_PROCESS => enqueue_selected_and_run(),
         B_PROMPT => {
             let text = with(|ui| {
                 let sh = ui.shared.lock().unwrap();
@@ -1737,6 +2411,7 @@ fn on_command(id: i32, code: u32) {
                     &s.title,
                     &e.title,
                     &format_time(e.record.duration),
+                    e.record.short_hash()?,
                     &e.record.transcript,
                 ))
             })
@@ -1756,64 +2431,144 @@ fn on_command(id: i32, code: u32) {
             }
         }
         B_CHECK => {
-            with(|ui| {
+            BULK.with(|b| b.borrow_mut().clear());
+            // Single-hash replies are matched by hash, like a bulk reply,
+            // even when another transcribed episode is selected.
+            let outcome = with(|ui| {
                 let reply = get_text(ui.ctl[&ID_REPLY]);
                 let sh = ui.shared.lock().unwrap();
-                let Some(ep) = show
-                    .and_then(|s| sh.lib.show(s))
-                    .and_then(|s| s.episodes.iter().find(|e| Some(&e.guid) == guid.as_ref()))
-                    .cloned()
-                else {
-                    return;
-                };
-                let paths = Paths::new(sh.paths.root.clone());
-                let settings = sh.settings.clone();
-                drop(sh);
-                match pipeline::check_reply(&ep, &reply) {
-                    Ok(cuts) => {
+                let sections = cutlist::parse_sections(&reply).map(|s| s.len()).unwrap_or(0);
+                if sections > 1 {
+                    let res = pipeline::check_bulk(&sh.lib, &reply);
+                    drop(sh);
+                    ui.pending = None;
+                    match res {
+                        Ok(list) => {
+                            set_text(ui.ctl[&ID_VIEW], &bulk_summary(&list));
+                            status(ui, &format!("Cut lists for {} checked. Review them in Details.", store::plural(list.len(), "episode")));
+                            BULK.with(|b| *b.borrow_mut() = list);
+                        }
+                        Err(e) => status(ui, &format!("The reply was not accepted: {e}")),
+                    }
+                    return None;
+                }
+                let res = pipeline::check_one(&sh.lib, &reply);
+                match res {
+                    Ok(b) => {
+                        let Some(ep) = sh
+                            .lib
+                            .show(b.show)
+                            .and_then(|s| s.episodes.iter().find(|e| e.guid == b.guid))
+                            .cloned()
+                        else {
+                            ui.pending = None;
+                            status(ui, "The reply was not accepted: that episode is gone.");
+                            return None;
+                        };
+                        let redirected = show != Some(b.show) || guid.as_ref() != Some(&b.guid);
+                        let for_line = format!("Cuts are for: {} - {}", b.show_title, b.title);
+                        let paths = Paths::new(sh.paths.root.clone());
+                        let settings = sh.settings.clone();
                         let args = ffargs::cut_args(
-                            &paths.original(show.unwrap(), &ep),
-                            &paths.cleaned(show.unwrap(), &ep),
-                            &cuts,
+                            &paths.original(b.show, &ep),
+                            &paths.cleaned(b.show, &ep),
+                            &b.cuts,
                             ep.record.duration,
                             pipeline::target(&settings, &ep).kbps,
                             pipeline::target(&settings, &ep).mono,
                         );
-                        let mut t = format!(
+                        let mut t = String::new();
+                        if redirected {
+                            t.push_str(&for_line);
+                            t.push_str("\n\n");
+                        }
+                        t.push_str(&format!(
                             "{} cut(s), {} removed:\n",
-                            cuts.len(),
-                            format_time(removed_seconds(&cuts))
-                        );
-                        for c in &cuts {
+                            b.cuts.len(),
+                            format_time(removed_seconds(&b.cuts))
+                        ));
+                        for c in &b.cuts {
                             t.push_str(&format!(
                                 "  {} - {}  ({})\n",
                                 format_time(c.start),
                                 format_time(c.end),
                                 format_time(c.end - c.start)
                             ));
+                            append_cut_words(&mut t, &ep.record.transcript, c.start, c.end);
+                            t.push('\n');
                         }
                         t.push_str("\nffmpeg command the app will run:\n");
                         t.push_str(&ffargs::display("ffmpeg.exe", &args));
                         t.push_str("\n\nPress Approve and cut to go ahead.");
+                        let st = if redirected {
+                            format!("{for_line}. Review the cut list in Details.")
+                        } else {
+                            "Cut list checked. Review it in Details.".into()
+                        };
+                        ui.pending = Some((b.show, b.guid.clone(), b.cuts.clone()));
                         set_text(ui.ctl[&ID_VIEW], &t);
-                        ui.pending = Some((show.unwrap(), ep.guid.clone(), cuts));
-                        status(ui, "Cut list checked. Review it in Details.");
+                        status(ui, &st);
+                        Some((b.show, b.guid, t, st, redirected))
                     }
                     Err(e) => {
                         ui.pending = None;
                         status(ui, &format!("The reply was not accepted: {e}"));
+                        None
                     }
                 }
-            });
+            })
+            .flatten();
+            if let Some((s, g, text, st, redirected)) = outcome {
+                if redirected {
+                    select_episode(s, &g);
+                    with(|ui| {
+                        set_text(ui.ctl[&ID_VIEW], &text);
+                        status(ui, &st);
+                    });
+                }
+            }
             update_buttons();
         }
+        B_APPROVE if bulk_pending() => {
+            let list = BULK.with(|b| std::mem::take(&mut *b.borrow_mut()));
+            with(|ui| set_text(ui.ctl[&ID_REPLY], ""));
+            background("Cutting", move |shared| {
+                let total = list.len();
+                let mut done = Vec::new();
+                let mut failed = Vec::new();
+                for (i, b) in list.into_iter().enumerate() {
+                    if cancelled() {
+                        return Err(CANCELLED.into());
+                    }
+                    let label = format!("Cutting {} of {total}: {}", i + 1, b.title);
+                    let (s, cuts) = (b.show, b.cuts);
+                    let res = episode_job(b.show, b.guid, move |st, p, ep| {
+                        pipeline::apply_cuts(&Labeled(&label), st, p, s, ep, cuts)?;
+                        Ok(String::new())
+                    })(shared);
+                    match res {
+                        Ok(_) => done.push(b.title),
+                        Err(e) if e == CANCELLED => return Err(e),
+                        Err(e) => failed.push(format!("\"{}\" failed: {e}", b.title)),
+                    }
+                }
+                Ok(if failed.is_empty() {
+                    format!("{} cut and ready in the feed.", store::plural(done.len(), "episode"))
+                } else {
+                    format!(
+                        "{} of {total} cut. {}",
+                        done.len(),
+                        failed.join(" ")
+                    )
+                })
+            });
+        }
         B_APPROVE => {
+            // Apply to the episode the checked reply named, even if the
+            // selection has moved on.
             let Some((s, g, cuts)) = with(|ui| ui.pending.take()).flatten() else {
                 return;
             };
-            if Some(s) != show || Some(&g) != guid.as_ref() {
-                return;
-            }
             with(|ui| set_text(ui.ctl[&ID_REPLY], ""));
             background(
                 "Cutting",
@@ -1844,8 +2599,8 @@ fn on_command(id: i32, code: u32) {
             };
             // Folder picker first (modal, re-enters the window procedure),
             // starting in the last folder used.
-            let last = with(|ui| ui.shared.lock().unwrap().conf.folder("export"))
-                .unwrap_or_default();
+            let last =
+                with(|ui| ui.shared.lock().unwrap().conf.folder("export")).unwrap_or_default();
             let Some(picked) = (unsafe { pick_folder(hwnd, &last) }) else {
                 return;
             };
@@ -1876,6 +2631,7 @@ fn on_command(id: i32, code: u32) {
                 status(ui, &msg);
             });
         }
+        B_BULK => unsafe { picker::open() },
         B_COPYFEED => {
             with(|ui| {
                 let link = get_text(ui.ctl[&ID_FEED]);
@@ -1887,8 +2643,8 @@ fn on_command(id: i32, code: u32) {
             cancel_job();
             with(|ui| status(ui, "Cancelling..."));
         }
-        B_TAB_OPT => set_page(true),
-        B_TAB_MAIN => set_page(false),
+        B_TAB_OPT => set_page(PAGE_OPT),
+        B_TAB_MAIN => set_page(PAGE_MAIN),
         B_MIN => unsafe {
             let _ = ShowWindow(hwnd, SW_MINIMIZE);
         },
@@ -1953,19 +2709,43 @@ fn on_command(id: i32, code: u32) {
                 s.export_dir = String::new();
                 s.require_token = ui.token_on;
                 let restart = old_bind != (s.bind.clone(), s.port);
+                let keep_new = get_text(ui.ctl[&OPT_NEW_ON_ADD]);
+                let bulk = get_text(ui.ctl[&OPT_BULK_SIZE]);
+                let keep_new = podcast_trim::config::parse_count(&keep_new, 0, podcast_trim::config::NEW_ON_ADD_MAX);
+                let bulk = podcast_trim::config::parse_count(&bulk, 1, podcast_trim::config::BULK_SIZE_MAX);
                 let r = save_json(&sh.paths.settings(), &sh.settings)
+                    .and_then(|_| {
+                        sh.conf.update_and_save(|c| {
+                            if let Some(n) = keep_new {
+                                c.set("episodes", "new-on-add", &n.to_string());
+                            }
+                            if let Some(n) = bulk {
+                                c.set("prompt", "bulk-size", &n.to_string());
+                            }
+                        })
+                    })
                     .and_then(|_| sh.conf.set_folder("export", &v[6]));
+                let (keep_now, bulk_now) = (sh.conf.new_on_add(), sh.conf.bulk_size());
                 drop(sh);
+                set_text(ui.ctl[&OPT_NEW_ON_ADD], &keep_now.to_string());
+                set_text(ui.ctl[&OPT_BULK_SIZE], &bulk_now.to_string());
+                let r = match (r, keep_new, bulk) {
+                    (Err(e), ..) => Err(e),
+                    (Ok(()), None, _) => Err(format!("NEW on add must be a whole number from 0 to {}; it stays {keep_now}.", podcast_trim::config::NEW_ON_ADD_MAX)),
+                    (Ok(()), _, None) => Err(format!("Bulk prompt size must be a whole number from 1 to {}; it stays {bulk_now}.", podcast_trim::config::BULK_SIZE_MAX)),
+                    (ok, ..) => ok,
+                };
                 status(
                     ui,
                     &match (r, restart) {
+                        (Err(e), _) if e.starts_with("NEW") || e.starts_with("Bulk") => format!("Options saved, except: {e}"),
                         (Err(e), _) => format!("Error: {e}"),
                         (Ok(()), true) => "Options saved. Restart Podcast Trim to use the new listen address or port.".into(),
                         (Ok(()), false) => "Options saved.".into(),
                     },
                 );
             });
-            set_page(false);
+            set_page(PAGE_MAIN);
             refresh_lists();
         }
         _ => {}
@@ -2061,7 +2841,7 @@ unsafe fn paint(hwnd: HWND) {
         // Tab sheet.
         let sheet = sr(ui, 14, 52, cw - 28, ch - 52 - 10);
         bevel(dc, &sheet, true);
-        let page = if ui.options { PAGE_OPT } else { PAGE_MAIN };
+        let page = ui.page;
         for (i, (r, p, raised)) in ui.frames.iter().enumerate() {
             if *p == page {
                 if !*raised {
@@ -2091,10 +2871,18 @@ unsafe fn paint(hwnd: HWND) {
             }
             text(dc, s, &mut r, TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         }
-        if ui.options {
+        if ui.page == PAGE_OPT {
+            let mut r = sr(ui, 668 + cw - WIN_W, 168, 208, 160);
+            text(
+                dc,
+                "NEW on add: how many of a new show's newest episodes are listed as NEW; older ones are listed as OLD. Bulk prompt size: the most episodes in one bulk AI prompt (1 to 20). Both are also in configuration.conf.",
+                &mut r,
+                DIM,
+                DT_LEFT | windows::Win32::Graphics::Gdi::DT_WORDBREAK,
+            );
             let mut r = sr(ui, 28, 404, cw - 60, 110);
             let note = format!(
-                "Note: ffmpeg.exe, ffprobe.exe, whisper-cli.exe (with its DLLs beside it) and ggml-*.bin models are found next to Podcast Trim.exe, in a folder inside it, or on PATH. configuration.conf next to the exe can point to them anywhere else.\nThe feed server is listening on {}. Use 0.0.0.0 to reach it from your phone on the same network, or 127.0.0.1 for this PC only. Address and port changes need a restart.\nPC address for phone: leave it blank to use this PC's detected address ({}). Opus bitrate: Auto picks it from each episode's source (as Opus Convert does), or enter a number from 6 to 256.",
+                "Note: ffmpeg.exe, ffprobe.exe, whisper-cli.exe (with its DLLs beside it) and ggml-*.bin models are found next to Podcast Trim.exe, in a folder inside it, or on PATH. configuration.conf next to the exe can point to them anywhere else.\nThe feed server is listening on {}. Use 0.0.0.0 to reach it from your phone on the same network, or 127.0.0.1 for this PC only. Address and port changes need a restart.\nPC address for phone: leave it blank to use this PC's detected address ({}). Opus bitrate: Auto follows each episode's source and stays at or above 96 kbps stereo or 64 kbps mono, or enter a number from 6 to 256.",
                 ui.server_addr,
                 ui.lan.map(|i| i.to_string()).unwrap_or_else(|| "none found".into())
             );
@@ -2121,8 +2909,6 @@ thread_local! {
 /// Drop-down list under the model field, drawn like the VGUI combo boxes:
 /// a dark-edged field-coloured list with a mustard highlight row.
 unsafe fn open_dropdown(btn: HWND, owner: i32, items: Vec<String>, current: &str) {
-    DROP_OWNER.with(|o| o.set(owner));
-    let d = DPI.load(std::sync::atomic::Ordering::Relaxed);
     let mut r = RECT::default();
     let _ = GetWindowRect(btn, &mut r);
     let cur = items
@@ -2130,6 +2916,23 @@ unsafe fn open_dropdown(btn: HWND, owner: i32, items: Vec<String>, current: &str
         .position(|m| m.eq_ignore_ascii_case(current))
         .map(|i| i as i32)
         .unwrap_or(-1);
+    open_popup(r.left, r.bottom, r.right - r.left, owner, items, cur);
+}
+
+/// The same list used as a right-click menu at screen point (x, y), moved
+/// up or left if it would go off the monitor.
+unsafe fn open_menu(x: i32, y: i32, owner: i32, items: Vec<String>) {
+    let d = DPI.load(std::sync::atomic::Ordering::Relaxed);
+    let (w, h) = (scale(170, d), scale(DROP_ROW, d) * items.len() as i32 + 2);
+    let (l, t, r, b) = work_area((x, y, 1, 1));
+    let x = if x + w > r { (x - w).max(l) } else { x };
+    let y = if y + h > b { (y - h).max(t) } else { y };
+    open_popup(x, y, w, owner, items, -1);
+}
+
+unsafe fn open_popup(x: i32, y: i32, w: i32, owner: i32, items: Vec<String>, cur: i32) {
+    DROP_OWNER.with(|o| o.set(owner));
+    let d = DPI.load(std::sync::atomic::Ordering::Relaxed);
     let h = scale(DROP_ROW, d) * items.len() as i32 + 2;
     DROP.with(|x| *x.borrow_mut() = (items, cur, cur));
     let instance: HINSTANCE = GetModuleHandleW(None).map(Into::into).unwrap_or_default();
@@ -2139,9 +2942,9 @@ unsafe fn open_dropdown(btn: HWND, owner: i32, items: Vec<String>, current: &str
         w!("PodcastTrimDrop"),
         None,
         WS_POPUP,
-        r.left,
-        r.bottom,
-        r.right - r.left,
+        x,
+        y,
+        w,
         h,
         main,
         None,
@@ -2356,6 +3159,7 @@ unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
         LPARAM(buf.as_mut_ptr() as isize),
     );
     let label = String::from_utf16_lossy(&buf[..n]);
+    let dim = SendMessageW(dis.hwndItem, LB_GETITEMDATA, WPARAM(dis.itemID as usize), LPARAM(0)).0 == 1;
     let brush = CreateSolidBrush(COLORREF(if sel { SEL } else { FIELD }));
     FillRect(dc, &r, brush);
     let _ = DeleteObject(brush);
@@ -2367,7 +3171,11 @@ unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
             dc,
             &label,
             &mut tr,
-            if sel { rgb(255, 255, 255) } else { TEXT },
+            match (sel, dim) {
+                (true, _) => rgb(255, 255, 255),
+                (false, true) => DIM,
+                (false, false) => TEXT,
+            },
             DT_LEFT | DT_SINGLELINE | DT_VCENTER | windows::Win32::Graphics::Gdi::DT_END_ELLIPSIS,
         );
         SelectObject(dc, old);
@@ -2410,7 +3218,16 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
                 };
                 if zoomed {
                     boxed(cx - 2, cy - 5, 7, 6);
-                    fill(dc, &RECT { left: cx - 5, top: cy - 2, right: cx + 2, bottom: cy + 4 }, BG);
+                    fill(
+                        dc,
+                        &RECT {
+                            left: cx - 5,
+                            top: cy - 2,
+                            right: cx + 2,
+                            bottom: cy + 4,
+                        },
+                        BG,
+                    );
                     boxed(cx - 5, cy - 2, 7, 6);
                 } else {
                     boxed(cx - 4, cy - 4, 9, 8);
@@ -2425,8 +3242,8 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
             let _ = DeleteObject(pen);
         }
         B_TAB_MAIN | B_TAB_OPT => {
-            let active = with(|ui| ui.options)
-                .map(|o| o == (id == B_TAB_OPT))
+            let active = with(|ui| ui.page)
+                .map(|p| (id == B_TAB_MAIN && p == PAGE_MAIN) || (id == B_TAB_OPT && p == PAGE_OPT))
                 .unwrap_or(id == B_TAB_MAIN);
             // Raised on three sides; the active tab joins the sheet below it.
             let mut t = r;
@@ -2566,6 +3383,10 @@ unsafe extern "system" fn clip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_COMMAND | WM_DRAWITEM | WM_MEASUREITEM | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX
         | WM_CTLCOLORSTATIC => {
             let main = GetAncestor(hwnd, GA_ROOT);
+            if main.0 as isize != MAIN.load(std::sync::atomic::Ordering::Relaxed) {
+                // A list in the bulk prompt picker.
+                return SendMessageW(main, msg, wp, lp);
+            }
             wndproc(main, msg, wp, lp)
         }
         WM_ERASEBKGND => {
@@ -2894,6 +3715,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             LRESULT(0)
         }
+        WM_CONTEXTMENU => {
+            episode_menu(lp);
+            LRESULT(0)
+        }
+        WM_MODEL_PICK if lp.0 as i32 == ID_EPS => {
+            seen_menu_pick(wp.0);
+            LRESULT(0)
+        }
         WM_MODEL_PICK => {
             with(|ui| {
                 if lp.0 as i32 == B_CHANNELS {
@@ -2912,7 +3741,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let stage = STAGE.lock().unwrap().clone();
             with(|ui| unsafe {
                 if ui.busy && !cancelled() && !stage.is_empty() {
-                    status(ui, &format!("{stage}... {}%", pct / 10));
+                    let line = ui
+                        .shared
+                        .lock()
+                        .unwrap()
+                        .queue
+                        .status_line(&stage, (pct / 10) as u32)
+                        .unwrap_or_else(|| format!("{stage}... {}%", pct / 10));
+                    status(ui, &line);
                 }
                 let _ = InvalidateRect(ui.ctl[&ID_PROGRESS], None, false);
             });
@@ -2964,6 +3800,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 });
             }
             refresh_lists();
+            if wp.0 == 1 {
+                let again = with(|ui| {
+                    !ui.busy
+                        && !ui.queue_preview
+                        && ui.shared.lock().unwrap().queue.pending_count() > 0
+                })
+                .unwrap_or(false);
+                if again {
+                    start_queue();
+                }
+            }
             LRESULT(0)
         }
         WM_DESTROY => {

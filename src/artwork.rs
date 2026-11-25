@@ -946,6 +946,7 @@ mod tests {
                     record: Record::default(),
                     cleaned_bytes: 0,
                     served: 0,
+                    seen: false,
                     image_url: "http://x/show.png".into(),
                 },
                 Episode {
@@ -957,6 +958,7 @@ mod tests {
                     record: Record::default(),
                     cleaned_bytes: 0,
                     served: 0,
+                    seen: false,
                     image_url: "http://x/ep2.png".into(),
                 },
                 Episode {
@@ -968,9 +970,11 @@ mod tests {
                     record: Record::default(),
                     cleaned_bytes: 0,
                     served: 0,
+                    seen: false,
                     image_url: String::new(),
                 },
             ],
+            seen_rule_done: false,
             image_url: "http://x/show.png".into(),
         };
 
