@@ -329,10 +329,59 @@ impl Paths {
 }
 
 pub fn load_json<T: for<'a> Deserialize<'a> + Default>(path: &Path) -> T {
-    fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    load_json_report(path).0
+}
+
+/// Load JSON, or `T::default()` if the file is missing or not valid JSON.
+/// An unreadable existing file is copied to `{name}.bad` (or `{name}.bad.N`)
+/// so the original bytes are kept. The warning is meant for the status line.
+pub fn load_json_report<T: for<'a> Deserialize<'a> + Default>(
+    path: &Path,
+) -> (T, Option<String>) {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return (T::default(), None),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(v) => (v, None),
+        Err(_) => {
+            let bak = unused_bad_backup(path);
+            let _ = fs::copy(path, &bak);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            let bak_name = bak
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| bak.display().to_string());
+            (
+                T::default(),
+                Some(format!(
+                    "Could not read {name}; it was copied to {bak_name} and the app started without that file's data."
+                )),
+            )
+        }
+    }
+}
+
+fn unused_bad_backup(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let first = dir.join(format!("{name}.bad"));
+    if !first.exists() {
+        return first;
+    }
+    for n in 2..1000 {
+        let cand = dir.join(format!("{name}.bad.{n}"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    dir.join(format!("{name}.bad.999"))
 }
 
 /// Write via a temp file and rename so a crash never leaves half a file.
@@ -426,5 +475,39 @@ mod tests {
         let back: Library = serde_json::from_str(&serde_json::to_string(&lib).unwrap()).unwrap();
         assert_eq!(back.shows[0].image_url, "http://x/s.jpg");
         assert_eq!(back.shows[0].episodes[0].image_url, "http://x/e.jpg");
+    }
+
+    #[test]
+    fn load_json_backs_up_unreadable_file() {
+        let dir = std::env::temp_dir().join(format!("pt-bad-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("library.json");
+        fs::write(&p, b"{not json").unwrap();
+        let (lib, warn): (Library, Option<String>) = load_json_report(&p);
+        assert!(lib.shows.is_empty());
+        let warn = warn.expect("warning");
+        assert!(warn.contains("library.json"));
+        assert!(warn.contains("library.json.bad"));
+        let bak = dir.join("library.json.bad");
+        assert_eq!(fs::read(&bak).unwrap(), b"{not json");
+        // A second failure must not overwrite the first backup.
+        fs::write(&p, b"{also bad").unwrap();
+        let (_, warn2) = load_json_report::<Library>(&p);
+        assert!(warn2.unwrap().contains("library.json.bad.2"));
+        assert_eq!(fs::read(dir.join("library.json.bad.2")).unwrap(), b"{also bad");
+        assert_eq!(fs::read(&bak).unwrap(), b"{not json");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_json_missing_file_is_silent_default() {
+        let p = std::env::temp_dir().join(format!(
+            "pt-missing-{}-nope/library.json",
+            std::process::id()
+        ));
+        let (lib, warn): (Library, Option<String>) = load_json_report(&p);
+        assert!(lib.shows.is_empty());
+        assert!(warn.is_none());
     }
 }

@@ -217,18 +217,60 @@ impl Queue {
 
     /// How many episodes `add_new` would add right now.
     pub fn new_waiting(&self, lib: &store::Library) -> usize {
-        lib.shows
+        self.new_waiting_counts(lib, None).0
+    }
+
+    /// How many episodes `add_new` would add, and the most in any one show.
+    pub fn new_waiting_counts(
+        &self,
+        lib: &store::Library,
+        only_show: Option<u32>,
+    ) -> (usize, usize) {
+        let mut total = 0;
+        let mut max_per_show = 0;
+        for s in lib
+            .shows
             .iter()
-            .flat_map(|s| s.episodes.iter().map(move |e| (s.id, e)))
-            .filter(|(_, e)| crate::seen::mark(e) == crate::seen::Mark::New)
-            .filter(|(show, e)| {
-                self.get(&JobId {
-                    show: *show,
-                    guid: e.guid.clone(),
+            .filter(|s| only_show.is_none_or(|id| id == s.id))
+        {
+            let n = s
+                .episodes
+                .iter()
+                .filter(|e| crate::seen::mark(e) == crate::seen::Mark::New)
+                .filter(|e| {
+                    self.get(&JobId {
+                        show: s.id,
+                        guid: e.guid.clone(),
+                    })
+                    .is_none_or(|j| matches!(j.status, JobStatus::Failed(_) | JobStatus::Cancelled))
                 })
-                .is_none_or(|j| matches!(j.status, JobStatus::Failed(_) | JobStatus::Cancelled))
-            })
-            .count()
+                .count();
+            total += n;
+            if n > max_per_show {
+                max_per_show = n;
+            }
+        }
+        (total, max_per_show)
+    }
+
+    /// Ask before queueing this many NEW episodes across the library.
+    pub const AUTOQUEUE_CONFIRM_TOTAL: usize = 50;
+    /// Ask before queueing this many NEW episodes in one show.
+    pub const AUTOQUEUE_CONFIRM_PER_SHOW: usize = 20;
+
+    /// Whether `Queue NEW` or Check for new + queue NEW should confirm first.
+    pub fn add_new_needs_confirm(total: usize, max_per_show: usize) -> bool {
+        total > Self::AUTOQUEUE_CONFIRM_TOTAL || max_per_show > Self::AUTOQUEUE_CONFIRM_PER_SHOW
+    }
+
+    /// Drop jobs with an empty guid, and keep only the first of a repeated
+    /// show+guid. Returns how many jobs were removed.
+    pub fn sanitize(&mut self) -> usize {
+        let before = self.jobs.len();
+        self.jobs.retain(|j| !j.id.guid.trim().is_empty());
+        let mut seen = std::collections::HashSet::new();
+        self.jobs.retain(|j| seen.insert(j.id.clone()));
+        before - self.jobs.len()
     }
 
     /// Remove a job that is not currently running. Returns whether it was removed.
@@ -389,7 +431,25 @@ impl Queue {
     }
 
     pub fn load(path: &Path) -> Queue {
-        store::load_json::<Queue>(path).snapshot_pending()
+        Self::load_report(path).0
+    }
+
+    /// Load the queue, rewrite in-progress jobs to Queued, and drop
+    /// incomplete entries. The optional warning is for the status line.
+    pub fn load_report(path: &Path) -> (Queue, Option<String>) {
+        let (raw, warn) = store::load_json_report::<Queue>(path);
+        let mut q = raw.snapshot_pending();
+        let dropped = q.sanitize();
+        let warn = match (warn, dropped) {
+            (Some(w), _) => Some(w),
+            (None, 0) => None,
+            (None, n) => Some(format!(
+                "Dropped {} incomplete queue {}.",
+                n,
+                if n == 1 { "entry" } else { "entries" }
+            )),
+        };
+        (q, warn)
     }
 
     /// Load jobs as saved, including in-progress statuses. For screenshots
@@ -707,5 +767,107 @@ mod tests {
         assert_eq!(q.queued_count(), 2);
         // A show id that does not exist adds nothing.
         assert_eq!(q.add_new(&lib, Some(99)), (0, 0));
+    }
+    #[test]
+    fn add_new_needs_confirm_at_caps() {
+        assert!(!Queue::add_new_needs_confirm(0, 0));
+        assert!(!Queue::add_new_needs_confirm(
+            Queue::AUTOQUEUE_CONFIRM_TOTAL,
+            Queue::AUTOQUEUE_CONFIRM_PER_SHOW,
+        ));
+        assert!(Queue::add_new_needs_confirm(
+            Queue::AUTOQUEUE_CONFIRM_TOTAL + 1,
+            1,
+        ));
+        assert!(Queue::add_new_needs_confirm(
+            21,
+            Queue::AUTOQUEUE_CONFIRM_PER_SHOW + 1,
+        ));
+    }
+
+    #[test]
+    fn new_waiting_counts_total_and_max_per_show() {
+        let mut lib = store::Library::default();
+        let a = lib.add_show("A".into(), "ua".into());
+        let b = lib.add_show("B".into(), "ub".into());
+        let mk = |g: &str, seen: bool| store::Episode {
+            guid: g.into(),
+            title: g.into(),
+            pub_date: String::new(),
+            source_url: String::new(),
+            state: State::New,
+            record: Default::default(),
+            cleaned_bytes: 0,
+            served: 0,
+            seen,
+            image_url: String::new(),
+        };
+        lib.show_mut(a).unwrap().episodes = (0..21).map(|i| mk(&format!("a{i}"), false)).collect();
+        lib.show_mut(b).unwrap().episodes = (0..40)
+            .map(|i| mk(&format!("b{i}"), i >= 30))
+            .collect();
+        let q = Queue::default();
+        // 21 NEW in A, 30 NEW in B; 10 in B are seen.
+        assert_eq!(q.new_waiting_counts(&lib, None), (51, 30));
+        assert_eq!(q.new_waiting(&lib), 51);
+        assert!(Queue::add_new_needs_confirm(51, 30));
+        assert_eq!(q.new_waiting_counts(&lib, Some(a)), (21, 21));
+        assert!(Queue::add_new_needs_confirm(21, 21));
+        assert_eq!(q.new_waiting_counts(&lib, Some(b)), (30, 30));
+        // add_new itself is not capped; the UI asks first.
+        let mut q = Queue::default();
+        assert_eq!(q.add_new(&lib, None), (51, 0));
+        assert_eq!(q.new_waiting(&lib), 0);
+    }
+
+    #[test]
+    fn sanitize_drops_empty_guid_and_duplicate_jobs() {
+        let mut q = Queue::default();
+        add(&mut q, 1, "ok", "T", State::New).unwrap();
+        q.jobs.push(Job {
+            id: JobId {
+                show: 1,
+                guid: String::new(),
+            },
+            title: "empty".into(),
+            show_title: "S".into(),
+            status: JobStatus::Queued,
+        });
+        q.jobs.push(Job {
+            id: JobId {
+                show: 1,
+                guid: "ok".into(),
+            },
+            title: "dup".into(),
+            show_title: "S".into(),
+            status: JobStatus::Queued,
+        });
+        assert_eq!(q.sanitize(), 2);
+        assert_eq!(q.jobs().len(), 1);
+        assert_eq!(q.jobs()[0].id.guid, "ok");
+    }
+
+    #[test]
+    fn load_report_repairs_queue_and_warns() {
+        let dir = std::env::temp_dir().join(format!("pt-qbad-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("queue.json");
+        let mut q = Queue::default();
+        add(&mut q, 1, "ok", "T", State::New).unwrap();
+        q.jobs.push(Job {
+            id: JobId {
+                show: 2,
+                guid: "  ".into(),
+            },
+            title: "bad".into(),
+            show_title: "S".into(),
+            status: JobStatus::Queued,
+        });
+        q.save_as_is(&path).unwrap();
+        let (loaded, warn) = Queue::load_report(&path);
+        assert_eq!(loaded.jobs().len(), 1);
+        assert_eq!(loaded.jobs()[0].id.guid, "ok");
+        assert!(warn.unwrap().contains("1 incomplete queue entry"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

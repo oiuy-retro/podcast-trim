@@ -9,7 +9,7 @@ use podcast_trim::cutlist::{format_time, removed_seconds, Cut};
 use podcast_trim::pipeline::{self, Env};
 use podcast_trim::queue::{self, JobId, Queue};
 use podcast_trim::server::{self, Shared, SharedRef};
-use podcast_trim::store::{self, load_json, save_json, Library, Paths, Settings, State};
+use podcast_trim::store::{self, load_json_report, save_json, Library, Paths, Settings, State};
 use podcast_trim::winstate::{self, WinState};
 use podcast_trim::{cutlist, ffargs, prompt, refresh, rss, seen, tools, transcript};
 use std::cell::RefCell;
@@ -215,6 +215,8 @@ static MAIN: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::ne
 /// Progress of the running job in 1/1000, and what it is doing.
 static PROGRESS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static STAGE: Mutex<String> = Mutex::new(String::new());
+/// After Check for new + queue NEW, ask on the UI thread if the batch is large.
+static AUTOQUEUE_ASK: Mutex<Option<Option<u32>>> = Mutex::new(None);
 static CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The external program the worker is waiting on, so Cancel can stop it.
 static CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
@@ -452,12 +454,13 @@ impl Neg for i32 {
 pub fn run() -> i32 {
     let paths = Paths::new(store::data_dir());
     let _ = std::fs::create_dir_all(&paths.root);
-    let settings: Settings = if paths.settings().exists() {
-        load_json::<Settings>(&paths.settings()).migrate()
+    let (settings, settings_note) = if paths.settings().exists() {
+        let (s, n) = load_json_report::<Settings>(&paths.settings());
+        (s.migrate(), n)
     } else {
-        Settings::default()
+        (Settings::default(), None)
     };
-    let mut lib: Library = load_json(&paths.library());
+    let (mut lib, lib_note): (Library, Option<String>) = load_json_report(&paths.library());
     // Clean up anything left behind by a delivery that couldn't delete at the time.
     for show in &lib.shows {
         for ep in &show.episodes {
@@ -485,12 +488,16 @@ pub fn run() -> i32 {
         Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true"),
         Err(_) => false,
     };
-    let queue = if queue_preview {
-        Queue::load_as_saved(&paths.queue())
+    let (queue, queue_note) = if queue_preview {
+        (Queue::load_as_saved(&paths.queue()), None)
     } else {
-        Queue::load(&paths.queue())
+        Queue::load_report(&paths.queue())
     };
     let pending_on_start = queue.pending_count();
+    let load_notes: Vec<String> = [settings_note, lib_note, queue_note]
+        .into_iter()
+        .flatten()
+        .collect();
     let shared: SharedRef = Arc::new(Mutex::new(Shared {
         lib,
         conf,
@@ -650,12 +657,24 @@ pub fn run() -> i32 {
             }
             Err(e) => status(ui, &e),
         });
-        if let Some(note) = &upgrade_note {
+        let mut start_notes = load_notes;
+        if let Some(note) = upgrade_note {
             with(|ui| ui.shared.lock().unwrap().note(note.clone()));
+            start_notes.push(note);
         }
         refresh_lists();
         if queue_preview {
             apply_queue_preview();
+        } else if !start_notes.is_empty() {
+            let mut line = start_notes.join(" ");
+            if pending_on_start > 0 {
+                line.push(' ');
+                line.push_str(&format!(
+                    "{} still in the queue.",
+                    store::plural(pending_on_start, "episode")
+                ));
+            }
+            with(|ui| status(ui, &line));
         } else if pending_on_start > 0 {
             with(|ui| {
                 status(
@@ -2297,24 +2316,75 @@ fn check_for_new(then_queue: bool) {
                 if then_queue && !cancelled() {
                     let mut sh = shared.lock().unwrap();
                     let lib = sh.lib.clone();
-                    let (added, _) = sh.queue.add_new(&lib, None);
-                    let _ = sh.queue.save(&sh.paths.queue());
-                    msg.push_str(&if added == 0 {
-                        " No NEW episodes to queue.".to_string()
+                    let (waiting, max_show) = sh.queue.new_waiting_counts(&lib, None);
+                    if waiting == 0 {
+                        msg.push_str(" No NEW episodes to queue.");
+                    } else if Queue::add_new_needs_confirm(waiting, max_show) {
+                        *AUTOQUEUE_ASK.lock().unwrap() = Some(None);
+                        msg.push_str(&format!(
+                            " {} waiting. Confirm in the next dialog to queue them.",
+                            store::plural(waiting, "NEW episode")
+                        ));
                     } else {
-                        format!(" Queued {}.", store::plural(added, "NEW episode"))
-                    });
+                        let (added, _) = sh.queue.add_new(&lib, None);
+                        let _ = sh.queue.save(&sh.paths.queue());
+                        msg.push_str(&format!(
+                            " Queued {}.",
+                            store::plural(added, "NEW episode")
+                        ));
+                    }
                 }
                 Ok(msg)
             });
         }
 
+fn autoqueue_confirm_text(total: usize, max_per_show: usize, only_show: Option<u32>) -> String {
+    if only_show.is_some() {
+        format!(
+            "This would queue {} in this show. That includes every NEW episode already in the show, not only ones found just now. Queue them anyway?",
+            store::plural(total, "NEW episode")
+        )
+    } else {
+        format!(
+            "This would queue {} ({} in one show). That includes every NEW episode already in the library, not only ones found just now. Queue them anyway?",
+            store::plural(total, "NEW episode"),
+            max_per_show
+        )
+    }
+}
+
+fn ask_yes_no(hwnd: HWND, title: &str, text: &str) -> bool {
+    unsafe {
+        let title = wide(title);
+        let text = wide(text);
+        MessageBoxW(
+            hwnd,
+            windows::core::PCWSTR(text.as_ptr()),
+            windows::core::PCWSTR(title.as_ptr()),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        ) == IDYES
+    }
+}
+
 /// Queue every NEW episode (of one show, or of all) and start the queue.
 fn queue_all_new(only: Option<u32>) {
-    let msg = with(|ui| {
-        if ui.queue_preview {
-            return None;
+    if with(|ui| ui.queue_preview).unwrap_or(true) {
+        return;
+    }
+    let (waiting, max_show, hwnd) = with(|ui| {
+        let sh = ui.shared.lock().unwrap();
+        let (n, m) = sh.queue.new_waiting_counts(&sh.lib, only);
+        (n, m, ui.hwnd)
+    })
+    .unwrap_or((0, 0, HWND::default()));
+    if waiting > 0 && Queue::add_new_needs_confirm(waiting, max_show) {
+        let text = autoqueue_confirm_text(waiting, max_show, only);
+        if !ask_yes_no(hwnd, "Queue NEW episodes", &text) {
+            with(|ui| status(ui, "Queue NEW cancelled."));
+            return;
         }
+    }
+    let msg = with(|ui| {
         let mut sh = ui.shared.lock().unwrap();
         let lib = sh.lib.clone();
         let (added, _) = sh.queue.add_new(&lib, only);
@@ -3960,6 +4030,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 });
             }
             refresh_lists();
+            let ask = AUTOQUEUE_ASK.lock().unwrap().take();
+            if let Some(only) = ask {
+                queue_all_new(only);
+            }
             if wp.0 == 1 {
                 let again = with(|ui| {
                     !ui.busy
