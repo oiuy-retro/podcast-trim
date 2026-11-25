@@ -1,7 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.1.2
 
+- Auto Opus stays at 96 kbps for stereo and 64 kbps for mono (instead of halving a second time).
+- Cut previews show the transcript words inside each cut.
 - New shows list only their newest episode as NEW (set with **NEW on add** in Options or `[episodes] new-on-add` in `configuration.conf`). Older episodes are listed as OLD in dimmer text. Episodes found later by Check for new are NEW.
 - SENT episodes count as seen and are drawn dimmed like OLD, keeping their SENT tag. Episodes sent before this version are marked seen once on upgrade.
 - Right-click menu on the episode list: Mark as seen, Mark as unseen, Mark older as seen, Mark older as unseen.
