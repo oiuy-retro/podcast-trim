@@ -242,4 +242,19 @@ mod tests {
             (40, 0, 1920, 1080)
         );
     }
+
+    #[test]
+    fn saved_wide_window_fits_a_2560x1440_work_area() {
+        // A 1721x750 window at 690,218, as saved in configuration.conf,
+        // stays that size on a 2560x1440 work area.
+        let saved = (690, 218, 1721, 750);
+        let work = (0, 0, 2560, 1440);
+        assert_eq!(fit(saved, work, (900, 600)), saved);
+        let header = anchored((470, 71, 108, 16), (0.65, 0.65, 0.0, 0.0), 1721 - 900, 750 - 600);
+        let eps = anchored((300, 68, 296, 296), (0.3, 0.65, 0.0, 1.0), 1721 - 900, 750 - 600);
+        assert!(header.2 > 0 && header.3 > 0);
+        // Queue NEW sits inside the Episode header, not past its right edge.
+        assert!(header.0 >= eps.0);
+        assert!(header.0 + header.2 <= eps.0 + eps.2);
+    }
 }
