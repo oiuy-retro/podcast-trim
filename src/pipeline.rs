@@ -591,15 +591,15 @@ mod tests {
         download(&env, &s, &paths, 1, &mut ep).unwrap();
         assert_eq!(ep.record.identical, Some(true));
         let t = target(&s, &ep);
-        assert_eq!((t.kbps, t.mono), (32, true));
+        assert_eq!((t.kbps, t.mono), (64, true));
         // Real stereo.
         *env.side_db.borrow_mut() = "-31.0".into();
         download(&env, &s, &paths, 1, &mut ep).unwrap();
         assert_eq!(ep.record.identical, Some(false));
-        assert_eq!((target(&s, &ep).kbps, target(&s, &ep).mono), (48, false));
-        // Overrides.
+        assert_eq!((target(&s, &ep).kbps, target(&s, &ep).mono), (96, false));
+        // Overrides. Mono still uses Auto's floor; a typed bitrate does not.
         s.channels = Channels::Mono;
-        assert_eq!((target(&s, &ep).kbps, target(&s, &ep).mono), (32, true));
+        assert_eq!((target(&s, &ep).kbps, target(&s, &ep).mono), (64, true));
         s.bitrate_k = 64;
         s.channels = Channels::Stereo;
         let t = target(&s, &ep);

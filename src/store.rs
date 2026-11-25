@@ -303,6 +303,9 @@ impl Paths {
     pub fn library(&self) -> PathBuf {
         self.root.join("library.json")
     }
+    pub fn queue(&self) -> PathBuf {
+        self.root.join("queue.json")
+    }
     pub fn show_dir(&self, show: u32) -> PathBuf {
         self.root.join("shows").join(show.to_string())
     }

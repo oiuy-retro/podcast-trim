@@ -1,7 +1,8 @@
 //! Opus bitrate from the source codec and its average bitrate.
-//! Same mapping as Opus Convert. The one difference: Opus Convert copies
-//! Opus sources untouched, but cutting always re-encodes, so an Opus source
-//! is re-encoded at its own bitrate, rounded up to the next Opus tier.
+//! Cutting always re-encodes, so an Opus source is re-encoded at its own
+//! bitrate, rounded up to the next tier. Auto never goes under
+//! [`STEREO_FLOOR`] / [`MONO_FLOOR`]: the old low tiers were fine at normal
+//! speed and fell apart when a podcast app played the file at 2× or faster.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CodecClass {
@@ -31,27 +32,27 @@ pub fn classify(codec: &str) -> CodecClass {
     }
 }
 
-/// Stereo Opus tier for a source. Lossy sources at or below 128k get lower
-/// tiers than Opus Convert uses (Opus at 48k is about as good as MP3 at 64k,
-/// so these never make a file needlessly larger than its source). Above
-/// 128k the Opus Convert ladders are kept. `None` = Opus source.
+/// Stereo Auto never encodes below this. A 2× time-stretch needs the
+/// fuller signal; 32–64 kbps speech tiers did not survive it.
+const STEREO_FLOOR: u32 = 96;
+/// Mono Auto floor, including stereo whose channels match and are folded
+/// to one channel.
+const MONO_FLOOR: u32 = 64;
+
+/// Stereo Opus tier for a source. At or below 128k the tier is
+/// [`STEREO_FLOOR`]. Above that, the rate steps up with the source.
+/// `None` = Opus source, which is handled in [`cut_kbps`].
 fn stereo_tier(codec: &str, source_kbps: Option<u32>) -> Option<u32> {
-    let low = |k: u32| match k {
-        0..=40 => 32,
-        41..=64 => 48,
-        65..=96 => 64,
-        _ => 96,
-    };
     match classify(codec) {
         CodecClass::Opus => None,
         CodecClass::Lossless | CodecClass::Dts => Some(192),
         CodecClass::Aac | CodecClass::Vorbis => Some(match source_kbps.unwrap_or(128) {
-            k @ 0..=128 => low(k),
+            0..=128 => STEREO_FLOOR,
             129..=192 => 128,
             _ => 160,
         }),
         CodecClass::Mp3 | CodecClass::Other => Some(match source_kbps.unwrap_or(128) {
-            k @ 0..=128 => low(k),
+            0..=128 => STEREO_FLOOR,
             129..=192 => 128,
             193..=256 => 160,
             _ => 192,
@@ -83,22 +84,27 @@ pub fn mono_of(stereo: u32) -> u32 {
 }
 
 /// Bitrate for re-encoding the cut episode (cutting always re-encodes, so
-/// an Opus source keeps its own tier instead of being copied).
+/// an Opus source keeps its own tier instead of being copied). The result
+/// is then raised to [`MONO_FLOOR`] or [`STEREO_FLOOR`].
 pub fn cut_kbps(codec: &str, source_kbps: Option<u32>, mono: bool) -> u32 {
-    let stereo = match stereo_tier(codec, source_kbps) {
-        Some(k) => k,
-        None => match source_kbps {
-            Some(k) if mono => {
-                return round_up(k, &MONO_TIERS).min(mono_of(round_up(k, &OPUS_TIERS)))
+    let rate = match stereo_tier(codec, source_kbps) {
+        Some(k) => {
+            if mono {
+                mono_of(k)
+            } else {
+                k
             }
-            Some(k) => return round_up(k, &OPUS_TIERS),
-            None => 96,
+        }
+        None => match source_kbps {
+            Some(k) if mono => round_up(k, &MONO_TIERS).min(mono_of(round_up(k, &OPUS_TIERS))),
+            Some(k) => round_up(k, &OPUS_TIERS),
+            None => STEREO_FLOOR,
         },
     };
     if mono {
-        mono_of(stereo)
+        rate.max(MONO_FLOOR)
     } else {
-        stereo
+        rate.max(STEREO_FLOOR)
     }
 }
 
@@ -198,14 +204,14 @@ mod tests {
 
     #[test]
     fn stereo_tiers() {
-        // Low-bitrate lossy sources get lower tiers.
-        assert_eq!(cut_kbps("mp3", Some(32), false), 32);
-        assert_eq!(cut_kbps("mp3", Some(40), false), 32);
-        assert_eq!(cut_kbps("mp3", Some(55), false), 48);
-        assert_eq!(cut_kbps("mp3", Some(64), false), 48);
-        assert_eq!(cut_kbps("aac", Some(96), false), 64);
+        // At or below 128k, stereo stays on the 2× floor.
+        assert_eq!(cut_kbps("mp3", Some(32), false), 96);
+        assert_eq!(cut_kbps("mp3", Some(40), false), 96);
+        assert_eq!(cut_kbps("mp3", Some(55), false), 96);
+        assert_eq!(cut_kbps("mp3", Some(64), false), 96);
+        assert_eq!(cut_kbps("aac", Some(96), false), 96);
         assert_eq!(cut_kbps("mp3", Some(128), false), 96);
-        // Upper tiers as in Opus Convert.
+        // Above 128k the rate still steps up with the source.
         assert_eq!(cut_kbps("mp3", Some(192), false), 128);
         assert_eq!(cut_kbps("mp3", Some(256), false), 160);
         assert_eq!(cut_kbps("mp3", Some(320), false), 192);
@@ -226,25 +232,30 @@ mod tests {
         assert_eq!(mono_of(128), 80);
         assert_eq!(mono_of(160), 96);
         assert_eq!(mono_of(192), 128);
-        assert_eq!(cut_kbps("mp3", Some(55), true), 32);
-        assert_eq!(cut_kbps("mp3", Some(24), true), 24);
+        assert_eq!(cut_kbps("mp3", Some(55), true), 64);
+        assert_eq!(cut_kbps("mp3", Some(24), true), 64);
+        assert_eq!(cut_kbps("mp3", Some(192), true), 80);
+        assert_eq!(cut_kbps("mp3", Some(320), true), 128);
     }
 
     #[test]
     fn opus_keeps_its_tier() {
-        assert_eq!(cut_kbps("opus", Some(32), false), 32);
-        assert_eq!(cut_kbps("opus", Some(40), false), 48);
+        assert_eq!(cut_kbps("opus", Some(32), false), 96);
+        assert_eq!(cut_kbps("opus", Some(40), false), 96);
+        assert_eq!(cut_kbps("opus", Some(128), false), 128);
         assert_eq!(cut_kbps("opus", Some(300), false), 192);
         assert_eq!(cut_kbps("opus", None, false), 96);
-        assert_eq!(cut_kbps("opus", Some(64), true), 40);
-        assert_eq!(cut_kbps("opus", Some(24), true), 24);
+        assert_eq!(cut_kbps("opus", Some(64), true), 64);
+        assert_eq!(cut_kbps("opus", Some(24), true), 64);
+        assert_eq!(cut_kbps("opus", Some(128), true), 80);
     }
 
     #[test]
-    fn never_bigger_than_a_lossy_source() {
+    fn speed_playback_floor() {
         for k in [24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 256, 320] {
-            for c in ["mp3", "aac", "vorbis"] {
-                assert!(cut_kbps(c, Some(k), false) <= k.max(32), "{c} {k}");
+            for c in ["mp3", "aac", "vorbis", "opus"] {
+                assert!(cut_kbps(c, Some(k), false) >= STEREO_FLOOR, "{c} {k} stereo");
+                assert!(cut_kbps(c, Some(k), true) >= MONO_FLOOR, "{c} {k} mono");
             }
         }
     }

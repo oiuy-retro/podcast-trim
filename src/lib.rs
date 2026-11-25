@@ -2,11 +2,12 @@
 pub mod bitrate;
 pub mod config;
 pub mod cutlist;
-pub mod menusounds;
 pub mod ffargs;
+pub mod menusounds;
 pub mod pipeline;
 pub mod progress;
 pub mod prompt;
+pub mod queue;
 pub mod refresh;
 pub mod rss;
 pub mod seen;
