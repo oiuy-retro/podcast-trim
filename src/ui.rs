@@ -1488,6 +1488,9 @@ fn selected_guids(ui: &Ui) -> Vec<String> {
         let style = GetWindowLongW(h, GWL_STYLE) as u32;
         if style & (LBS_EXTENDEDSEL as u32 | LBS_MULTIPLESEL as u32) != 0 {
             let n = SendMessageW(h, LB_GETSELCOUNT, WPARAM(0), LPARAM(0)).0.max(0) as usize;
+            if n == 0 {
+                return Vec::new();
+            }
             let mut idx = vec![0i32; n];
             let got = SendMessageW(h, LB_GETSELITEMS, WPARAM(n), LPARAM(idx.as_mut_ptr() as isize)).0.max(0) as usize;
             return idx[..got.min(n)]
@@ -2974,10 +2977,27 @@ unsafe fn text(
     color: u32,
     flags: windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT,
 ) {
-    let mut w: Vec<u16> = s.encode_utf16().collect();
+    // An empty Vec's pointer is a dangling placeholder (0x2); Windows'
+    // DrawTextW can read it even with a zero count and crash inside
+    // user32. Skip empty labels (the blank "Queue N NEW" link).
+    let Some(mut w) = draw_text_units(s) else {
+        return;
+    };
+    let n = w.len() - 1;
     SetTextColor(dc, COLORREF(color));
     SetBkMode(dc, TRANSPARENT);
-    DrawTextW(dc, &mut w, r, flags | DT_NOPREFIX);
+    DrawTextW(dc, &mut w[..n], r, flags | DT_NOPREFIX);
+}
+
+/// UTF-16 for DrawTextW with a trailing NUL kept in the buffer (not in the
+/// count), or None when there is nothing to draw.
+fn draw_text_units(s: &str) -> Option<Vec<u16>> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut w: Vec<u16> = s.encode_utf16().collect();
+    w.push(0);
+    Some(w)
 }
 
 unsafe fn fill(dc: HDC, r: &RECT, color: u32) {
@@ -3025,6 +3045,7 @@ unsafe fn paint(hwnd: HWND) {
             None,
             DI_NORMAL,
         );
+        podcast_trim::crash::trace_once("paint: caption", String::new);
         let mut tr = sr(ui, 30, 2, 400, CAPTION_H - 2);
         text(
             dc,
@@ -3033,6 +3054,7 @@ unsafe fn paint(hwnd: HWND) {
             TEXT,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER,
         );
+        podcast_trim::crash::trace_once("paint: frames", String::new);
         // Tab sheet.
         let sheet = sr(ui, 14, 52, cw - 28, ch - 52 - 10);
         bevel(dc, &sheet, true);
@@ -3054,6 +3076,7 @@ unsafe fn paint(hwnd: HWND) {
         if !IsZoomed(hwnd).as_bool() {
             grip(dc, &rc);
         }
+        podcast_trim::crash::trace_once("paint: labels", || format!("{} labels", ui.labels.len()));
         for (r, s, p, kind) in &ui.labels {
             if *p != page {
                 continue;
@@ -3092,6 +3115,7 @@ unsafe fn paint(hwnd: HWND) {
         SelectObject(dc, old);
     });
     let _ = EndPaint(hwnd, &ps);
+    podcast_trim::crash::trace_once("paint: done", String::new);
 }
 
 thread_local! {
@@ -3360,6 +3384,10 @@ unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
     );
     let label = String::from_utf16_lossy(&buf[..n]);
     let dim = SendMessageW(dis.hwndItem, LB_GETITEMDATA, WPARAM(dis.itemID as usize), LPARAM(0)).0 == 1;
+    podcast_trim::crash::trace_once(
+        &format!("draw list item ctl={} dim={dim} sel={sel}", dis.CtlID),
+        || format!("row {} ({} chars)", dis.itemID, n),
+    );
     let brush = CreateSolidBrush(COLORREF(if sel { SEL } else { FIELD }));
     FillRect(dc, &r, brush);
     let _ = DeleteObject(brush);
@@ -3394,7 +3422,10 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
     let n = GetWindowTextLengthW(dis.hwndItem);
     let mut buf = vec![0u16; n as usize + 1];
     let got = GetWindowTextW(dis.hwndItem, &mut buf);
-    let label = String::from_utf16_lossy(&buf[..got as usize]);
+    let label = String::from_utf16_lossy(&buf[..got.max(0) as usize]);
+    podcast_trim::crash::trace_once(&format!("draw button {id}"), || {
+        format!("{} chars, disabled={disabled}", label.chars().count())
+    });
     let flags = DT_LEFT | DT_SINGLELINE | DT_VCENTER;
     match id {
         B_MIN | B_MAX | B_CLOSE => {
@@ -3592,6 +3623,7 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
         }
     }
     SelectObject(dc, old);
+    podcast_trim::crash::trace_once(&format!("draw button {id} done"), String::new);
 }
 
 /// Parent that hides a list's or edit's own scroll bar; forwards everything
@@ -4063,5 +4095,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::draw_text_units;
+
+    /// Regression: the blank "Queue N NEW" link (every NEW already queued)
+    /// handed DrawTextW an empty slice whose pointer is a dangling 0x2,
+    /// which crashed inside user32 on Windows at the first paint.
+    #[test]
+    fn empty_label_is_not_drawn() {
+        assert!(draw_text_units("").is_none());
+    }
+
+    #[test]
+    fn label_buffer_is_nul_terminated_outside_the_count() {
+        let w = draw_text_units("Queue 5 NEW").unwrap();
+        assert_eq!(w.last(), Some(&0));
+        assert_eq!(String::from_utf16(&w[..w.len() - 1]).unwrap(), "Queue 5 NEW");
     }
 }

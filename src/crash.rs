@@ -21,6 +21,7 @@ static FIRST_LAYOUT: AtomicBool = AtomicBool::new(false);
 static FIRST_PAINT: AtomicBool = AtomicBool::new(false);
 static FIRST_SIZE: AtomicBool = AtomicBool::new(false);
 static FIRST_NCCALC: AtomicBool = AtomicBool::new(false);
+static TRACED_ONCE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Directory that actually received the logs (exe folder, or the temp dir).
 pub fn log_dir() -> PathBuf {
@@ -166,6 +167,26 @@ pub fn trace_first_layout() {
     }
 }
 
+/// Trace `key` (plus `detail`) the first time it is seen; later calls
+/// with the same key are free apart from the lookup.
+pub fn trace_once(key: &str, detail: impl FnOnce() -> String) {
+    {
+        let Ok(mut seen) = TRACED_ONCE.lock() else {
+            return;
+        };
+        if seen.iter().any(|k| k == key) || seen.len() > 512 {
+            return;
+        }
+        seen.push(key.to_string());
+    }
+    let extra = detail();
+    if extra.is_empty() {
+        trace(key);
+    } else {
+        trace(&format!("{key}: {extra}"));
+    }
+}
+
 pub fn trace_first_paint() {
     if !FIRST_PAINT.swap(true, Ordering::SeqCst) {
         trace("first paint");
@@ -241,11 +262,40 @@ pub fn exception_text(code: u32, address: usize) -> String {
     )
 }
 
-fn record_exception(code: u32, address: usize) {
+/// Extra lines for a crash: the module holding the faulting address as
+/// "name.dll+0xOFFSET", and for an access violation what was touched.
+pub fn exception_detail(module: Option<(&str, usize)>, address: usize, av: Option<(usize, usize)>) -> String {
+    let mut out = String::new();
+    match module {
+        Some((name, base)) => {
+            let file = name.rsplit(['\\', '/']).next().unwrap_or(name);
+            out.push_str(&format!(
+                "module: {file}+0x{:X} ({name}, base 0x{base:X})\n",
+                address.wrapping_sub(base)
+            ));
+        }
+        None => out.push_str("module: unknown\n"),
+    }
+    if let Some((kind, target)) = av {
+        let verb = match kind {
+            0 => "read",
+            1 => "write",
+            8 => "execute",
+            _ => "access",
+        };
+        out.push_str(&format!("tried to {verb} address 0x{target:X}\n"));
+    }
+    out
+}
+
+fn record_exception(code: u32, address: usize, detail: &str) {
     if EXCEPTION_LOGGED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let text = format!("Podcast Trim crashed.\n{}", exception_text(code, address));
+    let text = format!(
+        "Podcast Trim crashed.\n{}{detail}",
+        exception_text(code, address)
+    );
     let crash = crash_log_path();
     let _ = write_crash_log(&crash, &text);
     let _ = append_file(
@@ -269,7 +319,15 @@ fn install_exception_handlers() {
                 let code = rec.ExceptionCode.0 as u32;
                 let addr = rec.ExceptionAddress as usize;
                 if code != 0x80000003 && code != 0x80000004 {
-                    record_exception(code, addr);
+                    let av = (code == 0xC0000005 && rec.NumberParameters >= 2)
+                        .then(|| (rec.ExceptionInformation[0], rec.ExceptionInformation[1]));
+                    let module = module_at(addr);
+                    let detail = exception_detail(
+                        module.as_ref().map(|(n, b)| (n.as_str(), *b)),
+                        addr,
+                        av,
+                    );
+                    record_exception(code, addr, &detail);
                 }
             }
         }
@@ -283,6 +341,32 @@ fn install_exception_handlers() {
 
 #[cfg(not(windows))]
 fn install_exception_handlers() {}
+
+/// Full path and load address of the module that contains `addr`.
+#[cfg(windows)]
+fn module_at(addr: usize) -> Option<(String, usize)> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::System::LibraryLoader::{
+        GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    };
+    let mut module = HMODULE::default();
+    unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            PCWSTR(addr as *const u16),
+            &mut module,
+        )
+        .ok()?;
+        let mut buf = [0u16; 1024];
+        let n = GetModuleFileNameW(module, &mut buf) as usize;
+        if n == 0 || n >= buf.len() {
+            return None;
+        }
+        Some((String::from_utf16_lossy(&buf[..n]), module.0 as usize))
+    }
+}
 
 #[cfg(windows)]
 fn windows_module_dir() -> Option<PathBuf> {
@@ -333,6 +417,19 @@ mod tests {
         assert!(s.contains("0x1234"));
         assert!(exception_text(0xC0000005, 1).contains("ACCESS_VIOLATION"));
         assert_eq!(exception_name(0xDEADBEEF), "UNKNOWN");
+    }
+
+    #[test]
+    fn exception_detail_names_module_offset_and_target() {
+        let s = exception_detail(
+            Some((r"C:\Windows\System32\user32.dll", 0x7FF9_7570_0000)),
+            0x7FF9_7574_ED1B,
+            Some((0, 0x2)),
+        );
+        assert!(s.contains("module: user32.dll+0x4ED1B"), "{s}");
+        assert!(s.contains("tried to read address 0x2"), "{s}");
+        let u = exception_detail(None, 5, None);
+        assert_eq!(u, "module: unknown\n");
     }
 
     #[test]

@@ -228,6 +228,9 @@ unsafe fn layout(hwnd: HWND) {
 fn ticked(list: HWND) -> Vec<usize> {
     unsafe {
         let n = SendMessageW(list, LB_GETSELCOUNT, WPARAM(0), LPARAM(0)).0.max(0) as usize;
+        if n == 0 {
+            return Vec::new();
+        }
         let mut idx = vec![0i32; n];
         let got = SendMessageW(list, LB_GETSELITEMS, WPARAM(n), LPARAM(idx.as_mut_ptr() as isize)).0.max(0) as usize;
         idx[..got.min(n)].iter().map(|i| *i as usize).collect()
