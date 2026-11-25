@@ -297,6 +297,15 @@ impl Paths {
     pub fn work(&self, show: u32, ep: &Episode, ext: &str) -> PathBuf {
         self.show_dir(show).join(format!("{}.{ext}", ep.key()))
     }
+    pub fn art_dir(&self, show: u32) -> PathBuf {
+        self.show_dir(show).join("art")
+    }
+    pub fn art_manifest(&self, show: u32) -> PathBuf {
+        self.art_dir(show).join("manifest.json")
+    }
+    pub fn art_file(&self, show: u32, name: &str) -> PathBuf {
+        self.art_dir(show).join(name)
+    }
 }
 
 pub fn load_json<T: for<'a> Deserialize<'a> + Default>(path: &Path) -> T {
