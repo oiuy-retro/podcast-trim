@@ -11,7 +11,9 @@ Tested with FFmpeg `9.0.2-essentials_build` (Gyan) and whisper.cpp `b5454` (`whi
 | [windows-rs](https://github.com/microsoft/windows-rs) | MIT OR Apache-2.0 | Win32 UI, GDI drawing, WinHTTP, clipboard |
 | [serde](https://github.com/serde-rs/serde) | MIT OR Apache-2.0 | Settings and library files |
 | [serde_json](https://github.com/serde-rs/json) | MIT OR Apache-2.0 | JSON settings, library, and AI replies |
-| [sha2](https://github.com/RustCrypto/hashes) | MIT OR Apache-2.0 | SHA-256 of original downloads |
+| [sha2](https://github.com/RustCrypto/hashes) | MIT OR Apache-2.0 | SHA-256 of original downloads and artwork cache keys |
+| [image](https://github.com/image-rs/image) | MIT OR Apache-2.0 | Decode and JPEG-encode show/episode artwork |
+| [ab_glyph](https://github.com/alexheretic/ab-glyph) | Apache-2.0 | Rasterize the TRIMMED cover badge from the system Impact font |
 | [winres](https://github.com/mxre/winres) | MIT | Icon and manifest at build time |
 | [Rust](https://www.rust-lang.org/) / LLVM | MIT / Apache-2.0 / NCSA | Compiler |
 
@@ -27,7 +29,7 @@ FFmpeg is a trademark of Fabrice Bellard / the FFmpeg project.
 
 ## Windows
 
-Tahoma, Common Controls 6, and WinHTTP are part of Windows. This program uses them by name and does not redistribute Windows or its fonts.
+Tahoma, Impact, Common Controls 6, and WinHTTP are part of Windows. This program uses them by name and does not redistribute Windows or its fonts.
 
 ## Style
 

@@ -11,7 +11,7 @@ use podcast_trim::queue::{self, JobId, Queue};
 use podcast_trim::server::{self, Shared, SharedRef};
 use podcast_trim::store::{self, load_json, save_json, Library, Paths, Settings, State};
 use podcast_trim::winstate::{self, WinState};
-use podcast_trim::{cutlist, ffargs, prompt, refresh, rss, seen, tools, transcript};
+use podcast_trim::{artwork, cutlist, ffargs, prompt, refresh, rss, seen, tools, transcript};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
@@ -2053,6 +2053,9 @@ fn episode_job(
         let settings = tools::resolve(&settings, &conf, &tools::exe_dir())?;
         let paths = Paths::new(root);
         let res = work(&settings, &paths, &mut ep);
+        if res.is_ok() && ep.state == State::Ready && !ep.image_url.is_empty() {
+            artwork::ensure_episode_url(&paths, show, &ep.image_url, &net::get);
+        }
         let mut sh = shared.lock().unwrap();
         if let Some(slot) = sh
             .lib
@@ -2323,15 +2326,24 @@ fn on_command(id: i32, code: u32) {
             background("Reading feed", move |shared| {
                 let xml = net::get(&url)?;
                 let feed = rss::parse(&String::from_utf8_lossy(&xml))?;
-                let mut sh = shared.lock().unwrap();
-                if sh.lib.shows.iter().any(|s| s.feed_url == url) {
-                    return Err("That show is already in the list.".into());
-                }
-                let keep_new = sh.conf.new_on_add();
-                let id = sh.lib.add_show(feed.title.clone(), url);
-                let show = sh.lib.show_mut(id).unwrap();
-                let n = pipeline::merge_feed(show, &feed);
-                let old = seen::apply_rule(show, keep_new);
+                let (n, old, item, paths) = {
+                    let mut sh = shared.lock().unwrap();
+                    if sh.lib.shows.iter().any(|s| s.feed_url == url) {
+                        return Err("That show is already in the list.".into());
+                    }
+                    let keep_new = sh.conf.new_on_add();
+                    let id = sh.lib.add_show(feed.title.clone(), url);
+                    let show = sh.lib.show_mut(id).unwrap();
+                    let n = pipeline::merge_feed(show, &feed);
+                    let old = seen::apply_rule(show, keep_new);
+                    (
+                        n,
+                        old,
+                        artwork::collect_show_urls(show, 10),
+                        Paths::new(sh.paths.root.clone()),
+                    )
+                };
+                artwork::sync_show_item(&paths, &item, &net::get);
                 Ok(if old == 0 {
                     format!("Added {} with {}.", feed.title, store::plural(n, "episode"))
                 } else {
@@ -2370,6 +2382,18 @@ fn on_command(id: i32, code: u32) {
                 };
                 let done = |n: usize, total: usize| set_progress(STAGE, n as f64 / total as f64);
                 let out = refresh::check_all(&targets, 4, &net::get, &apply, &cancelled, &done);
+                if !cancelled() {
+                    let (paths, items): (Paths, Vec<_>) = {
+                        let sh = shared.lock().unwrap();
+                        let items = targets
+                            .iter()
+                            .filter_map(|(id, _, _)| sh.lib.show(*id))
+                            .map(|s| artwork::collect_show_urls(s, 10))
+                            .collect();
+                        (Paths::new(sh.paths.root.clone()), items)
+                    };
+                    artwork::sync_shows(&paths, &items, 4, &net::get, &cancelled);
+                }
                 Ok(refresh::summary(
                     &out,
                     targets.len(),

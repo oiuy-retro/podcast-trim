@@ -73,6 +73,15 @@ Anything else is rejected with the line number of the problem.
 - The server speaks plain HTTP. To reach it from outside your home network, use a private VPN such as Tailscale instead of opening a port on your router.
 - Windows Firewall will ask whether to allow Podcast Trim on the network the first time it starts. Allow it on private networks.
 
+### Artwork
+
+Each show's feed carries the artwork of the source feed, stamped at the bottom with **TRIMMED** in Impact (white with a black border) so trimmed feeds stand out in your podcast app.
+
+- Show artwork is read from the source feed's `<itunes:image href="...">`, or from its RSS 2.0 `<image><url>` when there is no `itunes:image`.
+- Episode artwork is read from each item's `<itunes:image href="...">`, then `<media:thumbnail url="...">`, then an image `<media:content url="...">` (with `medium="image"` or an `image/...` type). Episodes without their own picture inherit the show's badged cover.
+- When you add a show or run **Check for new** (and when an episode finishes cutting), Podcast Trim downloads the cover, draws the badge with Windows' own `impact.ttf` (no font file is bundled; if Impact or a source cover is missing, it falls back to the unbadged URL), caches the result in `shows/<id>/art/`, and serves it from `/art/<show-id>/<hash>.jpg`. Episodes whose URL matches the show cover reuse the show's cached file.
+- Shows added before this version get their badged cover the next time **Check for new** runs. Refresh the feed in AntennaPod afterwards; AntennaPod may keep showing an earlier cached cover until its image cache updates.
+
 ## Audio format
 
 Trimmed episodes are Ogg Opus (`.opus`, encoded with libopus, variable bitrate). With **Opus bitrate** and **Channels** set to Auto (the defaults), both are picked from the original with ffprobe.

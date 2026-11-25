@@ -1,4 +1,5 @@
 //! Podcast Trim core: everything except the Windows UI and HTTPS download.
+pub mod artwork;
 pub mod bitrate;
 pub mod config;
 pub mod cutlist;
