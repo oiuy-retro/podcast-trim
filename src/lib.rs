@@ -2,6 +2,7 @@
 pub mod artwork;
 pub mod bitrate;
 pub mod config;
+pub mod crash;
 pub mod cutlist;
 pub mod ffargs;
 pub mod menusounds;

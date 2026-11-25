@@ -54,11 +54,14 @@ export =
 # [episodes] new-on-add = how many of a show's newest episodes are listed as
 # NEW when the show is added (0 or more). Older ones are listed as OLD
 # (already seen). Episodes found later by Check for new are always NEW.
+# [episodes] queue-after-refresh = on to add every NEW episode to the
+# download + transcribe queue after each Check for new (off by default).
 # [prompt] bulk-size = the most episodes one bulk AI prompt holds (1 to 20).
-# Both can also be changed in Options.
+# All three can also be changed in Options.
 
 [episodes]
 new-on-add = 1
+queue-after-refresh = off
 
 [prompt]
 bulk-size = 3
@@ -314,6 +317,14 @@ impl Conf {
             .unwrap_or(NEW_ON_ADD_DEFAULT)
     }
 
+    /// `[episodes] queue-after-refresh`; on, yes, true or 1 means on.
+    /// Missing or anything else means off.
+    pub fn queue_after_refresh(&self) -> bool {
+        self.get("episodes", "queue-after-refresh")
+            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "yes" | "true" | "1"))
+    }
+
+
     /// `[prompt] bulk-size`; missing or invalid means the default (3).
     pub fn bulk_size(&self) -> usize {
         self.get("prompt", "bulk-size")
@@ -471,6 +482,12 @@ mod tests {
         assert_eq!((c.new_on_add(), c.bulk_size()), (1, 3));
         c.set("prompt", "bulk-size", " 20 ");
         assert_eq!(c.bulk_size(), 20);
+        assert!(!old.queue_after_refresh());
+        assert!(!t.queue_after_refresh());
+        c.set("episodes", "queue-after-refresh", "On");
+        assert!(c.queue_after_refresh());
+        c.set("episodes", "queue-after-refresh", "maybe");
+        assert!(!c.queue_after_refresh());
         assert_eq!(parse_count("-1", 0, 5), None);
         assert_eq!(parse_count("4", 0, 5), Some(4));
     }

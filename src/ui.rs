@@ -9,7 +9,7 @@ use podcast_trim::cutlist::{format_time, removed_seconds, Cut};
 use podcast_trim::pipeline::{self, Env};
 use podcast_trim::queue::{self, JobId, Queue};
 use podcast_trim::server::{self, Shared, SharedRef};
-use podcast_trim::store::{self, load_json, save_json, Library, Paths, Settings, State};
+use podcast_trim::store::{self, load_json_report, save_json, Library, Paths, Settings, State};
 use podcast_trim::winstate::{self, WinState};
 use podcast_trim::{artwork, cutlist, ffargs, prompt, refresh, rss, seen, tools, transcript};
 use std::cell::RefCell;
@@ -92,6 +92,18 @@ const OPT_BASE: i32 = 300;
 const B_CHANNELS: i32 = 213;
 const B_MODEL: i32 = 214;
 const B_BULK: i32 = 219;
+/// The small arrow beside Check for new; opens `REFRESH_MENU`.
+const B_REFRESH_MORE: i32 = 220;
+/// Options check box for `[episodes] queue-after-refresh`.
+const B_AUTOQ: i32 = 221;
+/// "Queue N NEW" in the Episode header; blank while nothing NEW is waiting.
+const B_QNEW: i32 = 222;
+
+const REFRESH_MENU: [&str; 2] = ["Check for new", "Check for new + queue NEW"];
+/// Right-click on the show list.
+const SHOW_MENU: [&str; 2] = ["Queue NEW in this show", "Check for new + queue NEW"];
+/// Width of the two menus above, wide enough for "Check for new + queue NEW".
+const QUEUE_MENU_W: i32 = 190;
 /// Options rows for the NEW rule and the bulk prompt size (configuration.conf).
 const OPT_NEW_ON_ADD: i32 = 320;
 const OPT_BULK_SIZE: i32 = 321;
@@ -134,6 +146,8 @@ struct Ui {
     /// Load in-progress jobs as-is and draw a fake progress state (screenshots).
     queue_preview: bool,
     token_on: bool,
+    /// Options check box state for `[episodes] queue-after-refresh`.
+    autoq_on: bool,
     channels: store::Channels,
     models: Vec<String>,
     model: String,
@@ -201,6 +215,8 @@ static MAIN: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::ne
 /// Progress of the running job in 1/1000, and what it is doing.
 static PROGRESS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static STAGE: Mutex<String> = Mutex::new(String::new());
+/// After Check for new + queue NEW, ask on the UI thread if the batch is large.
+static AUTOQUEUE_ASK: Mutex<Option<Option<u32>>> = Mutex::new(None);
 static CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The external program the worker is waiting on, so Cancel can stop it.
 static CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
@@ -436,14 +452,26 @@ impl Neg for i32 {
 }
 
 pub fn run() -> i32 {
+    podcast_trim::crash::trace_detail("data dir", &store::data_dir().display().to_string());
     let paths = Paths::new(store::data_dir());
     let _ = std::fs::create_dir_all(&paths.root);
-    let settings: Settings = if paths.settings().exists() {
-        load_json::<Settings>(&paths.settings()).migrate()
+    podcast_trim::crash::trace("data dir created");
+    let (settings, settings_note) = if paths.settings().exists() {
+        let (s, n) = load_json_report::<Settings>(&paths.settings());
+        (s.migrate(), n)
     } else {
-        Settings::default()
+        (Settings::default(), None)
     };
-    let mut lib: Library = load_json(&paths.library());
+    podcast_trim::crash::trace("settings loaded");
+    let (mut lib, lib_note): (Library, Option<String>) = load_json_report(&paths.library());
+    podcast_trim::crash::trace_detail(
+        "library loaded",
+        &format!(
+            "{} shows, {} episodes",
+            lib.shows.len(),
+            lib.shows.iter().map(|s| s.episodes.len()).sum::<usize>()
+        ),
+    );
     // Clean up anything left behind by a delivery that couldn't delete at the time.
     for show in &lib.shows {
         for ep in &show.episodes {
@@ -459,6 +487,7 @@ pub fn run() -> i32 {
     let channels = settings.channels;
     let model = settings.whisper_model.clone();
     let mut conf = Conf::load(&tools::exe_dir(), &paths.root);
+    podcast_trim::crash::trace("config loaded");
     if conf.folder("export").is_empty() && !settings.export_dir.trim().is_empty() {
         let _ = conf.set_folder("export", settings.export_dir.trim());
     }
@@ -466,16 +495,25 @@ pub fn run() -> i32 {
     let upgrade_note = upgrade_seen(&mut lib, &paths, conf.new_on_add());
     let models = tools::model_names(&conf, &tools::exe_dir());
     let saved = WinState::from_conf(&conf);
+    let autoq_on = conf.queue_after_refresh();
     let queue_preview = match std::env::var("PODCAST_TRIM_QUEUE_PREVIEW") {
         Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true"),
         Err(_) => false,
     };
-    let queue = if queue_preview {
-        Queue::load_as_saved(&paths.queue())
+    let (queue, queue_note) = if queue_preview {
+        (Queue::load_as_saved(&paths.queue()), None)
     } else {
-        Queue::load(&paths.queue())
+        Queue::load_report(&paths.queue())
     };
     let pending_on_start = queue.pending_count();
+    podcast_trim::crash::trace_detail(
+        "queue loaded",
+        &format!("{pending_on_start} pending"),
+    );
+    let load_notes: Vec<String> = [settings_note, lib_note, queue_note]
+        .into_iter()
+        .flatten()
+        .collect();
     let shared: SharedRef = Arc::new(Mutex::new(Shared {
         lib,
         conf,
@@ -559,8 +597,13 @@ pub fn run() -> i32 {
         )
         .unwrap_or_default();
         if hwnd.0.is_null() {
+            podcast_trim::crash::trace("CreateWindow failed");
             return 1;
         }
+        podcast_trim::crash::trace_detail(
+            "window created",
+            &format!("{}x{} at {},{} maximized={maximized}", place.2, place.3, place.0, place.1),
+        );
         MAIN.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
         let ui = Ui {
             hwnd,
@@ -577,6 +620,7 @@ pub fn run() -> i32 {
             page: PAGE_MAIN,
             queue_preview,
             token_on,
+            autoq_on,
             channels,
             models,
             model,
@@ -607,8 +651,11 @@ pub fn run() -> i32 {
         );
         FONT.store(ui.font.0 as isize, std::sync::atomic::Ordering::Relaxed);
         UI.with(|u| *u.borrow_mut() = Some(ui));
+        podcast_trim::crash::trace("ui installed");
         build_controls(instance);
+        podcast_trim::crash::trace("controls built");
         layout();
+        podcast_trim::crash::trace("layout after controls");
         let hraw = hwnd.0 as isize;
         let notify: server::Notify = Arc::new(move || {
             let _ = PostMessageW(HWND(hraw as _), WM_REFRESH, WPARAM(0), LPARAM(0));
@@ -634,12 +681,26 @@ pub fn run() -> i32 {
             }
             Err(e) => status(ui, &e),
         });
-        if let Some(note) = &upgrade_note {
+        let mut start_notes = load_notes;
+        if let Some(note) = upgrade_note {
             with(|ui| ui.shared.lock().unwrap().note(note.clone()));
+            start_notes.push(note);
         }
+        podcast_trim::crash::trace("refresh lists");
         refresh_lists();
+        podcast_trim::crash::trace("lists ready");
         if queue_preview {
             apply_queue_preview();
+        } else if !start_notes.is_empty() {
+            let mut line = start_notes.join(" ");
+            if pending_on_start > 0 {
+                line.push(' ');
+                line.push_str(&format!(
+                    "{} still in the queue.",
+                    store::plural(pending_on_start, "episode")
+                ));
+            }
+            with(|ui| status(ui, &line));
         } else if pending_on_start > 0 {
             with(|ui| {
                 status(
@@ -651,7 +712,9 @@ pub fn run() -> i32 {
                 )
             });
         }
+        podcast_trim::crash::trace("ShowWindow");
         let _ = ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW });
+        podcast_trim::crash::trace("entering message loop");
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             if picker::current().is_some_and(|p| IsDialogMessageW(p, &msg).as_bool()) {
@@ -1000,6 +1063,7 @@ fn anchored(r: (i32, i32, i32, i32), a: Anchor, dx: i32, dy: i32) -> (i32, i32, 
 
 /// Place everything for the current client size.
 fn layout() {
+    podcast_trim::crash::trace_first_layout();
     with(|ui| unsafe {
         let d = ui.dpi;
         let mut rc = RECT::default();
@@ -1165,7 +1229,8 @@ fn build_controls(instance: HINSTANCE) {
         field(ui, instance, EDIT, ID_URL, m, (24, 392, 264, 22));
         ui.anchor = Anchor(0.0, 0.0, 1.0, 1.0);
         button(ui, instance, "Add show", B_ADD, m, 24, 422, 90);
-        button(ui, instance, "Check for new", B_REFRESH, m, 120, 422, 110);
+        button(ui, instance, "Check for new", B_REFRESH, m, 120, 422, 92);
+        child(ui, instance, ui.hwnd, w!("BUTTON"), "", BTN, B_REFRESH_MORE, m, (212, 422, 18, 24));
 
         ui.anchor = Anchor(0.3, 0.65, 0.0, 1.0);
         boxed(
@@ -1178,6 +1243,9 @@ fn build_controls(instance: HINSTANCE) {
             Some("Episode"),
             (300, 68, 296, 296),
         );
+        // Inside the Episode header, right-aligned; blank when nothing is NEW.
+        ui.anchor = Anchor(0.65, 0.65, 0.0, 0.0);
+        child(ui, instance, ui.hwnd, w!("BUTTON"), "", BTN, B_QNEW, m, (470, 71, 108, 16));
         ui.anchor = Anchor(0.3, 0.3, 1.0, 1.0);
         button(
             ui,
@@ -1360,6 +1428,7 @@ fn build_controls(instance: HINSTANCE) {
             let h = field(ui, instance, EDIT, id, o, (816, y, 60, 22));
             set_text(h, &v.to_string());
         }
+        child(ui, instance, ui.hwnd, w!("BUTTON"), "Queue NEW after Check for new", BTN, B_AUTOQ, o, (668, 170, 208, 20));
         ui.anchor = FIXED;
     });
     set_page(PAGE_MAIN);
@@ -1419,6 +1488,9 @@ fn selected_guids(ui: &Ui) -> Vec<String> {
         let style = GetWindowLongW(h, GWL_STYLE) as u32;
         if style & (LBS_EXTENDEDSEL as u32 | LBS_MULTIPLESEL as u32) != 0 {
             let n = SendMessageW(h, LB_GETSELCOUNT, WPARAM(0), LPARAM(0)).0.max(0) as usize;
+            if n == 0 {
+                return Vec::new();
+            }
             let mut idx = vec![0i32; n];
             let got = SendMessageW(h, LB_GETSELITEMS, WPARAM(n), LPARAM(idx.as_mut_ptr() as isize)).0.max(0) as usize;
             return idx[..got.min(n)]
@@ -1509,14 +1581,18 @@ fn fill_list(h: HWND, items: &[String], keep: &[usize], empty: &str) {
     }
 }
 
-fn episode_label(show: u32, e: &store::Episode, queue: &Queue) -> String {
-    let tag = queue
+/// The queue's list tag for an episode, if it is in the queue.
+fn queue_tag(show: u32, e: &store::Episode, queue: &Queue) -> Option<&'static str> {
+    queue
         .get(&JobId {
             show,
             guid: e.guid.clone(),
         })
         .and_then(|j| j.status.list_tag())
-        .unwrap_or(episode_tag(e));
+}
+
+fn episode_label(show: u32, e: &store::Episode, queue: &Queue) -> String {
+    let tag = queue_tag(show, e, queue).unwrap_or(episode_tag(e));
     format!("[{tag}] {}", e.title)
 }
 
@@ -1638,21 +1714,37 @@ fn refresh_lists_keep(keep_guid: Option<&str>) {
                     .unzip()
             })
             .unwrap_or_default();
+        // Dimmed while OLD or seen SENT; a queue tag shows at full brightness.
         let dim: Vec<bool> = show
-            .map(|s| s.episodes.iter().map(seen::dimmed).collect())
+            .map(|s| {
+                s.episodes
+                    .iter()
+                    .map(|e| seen::dimmed(e) && queue_tag(s.id, e, &sh.queue).is_none())
+                    .collect()
+            })
             .unwrap_or_default();
         let none = if show.is_some() {
             "This show has no episodes yet."
         } else {
             "No show is selected."
         };
-        let keep_ep: Vec<usize> = match keep_guid {
-            Some(g) => guids.iter().position(|x| x == g).into_iter().collect(),
-            None => keep_ep,
+        let keep_ep = if let Some(g) = keep_guid {
+            guids.iter().position(|x| x == g).into_iter().collect()
+        } else {
+            keep_ep
         };
         ui.ep_guids = guids;
         fill_list(ui.ctl[&ID_EPS], &eps, &keep_ep, none);
         set_dimmed(ui.ctl[&ID_EPS], &dim);
+        if let Some(h) = ui.ctl.get(&B_QNEW) {
+            let n = sh.queue.new_waiting(&sh.lib);
+            let t = if n == 0 { String::new() } else { format!("Queue {n} NEW") };
+            set_text(*h, &t);
+            unsafe {
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(*h, n > 0 && !ui.queue_preview);
+                let _ = InvalidateRect(*h, None, true);
+            }
+        }
         let link = show.map(|s| feed_link(ui, &sh, s.id)).unwrap_or_default();
         set_text(ui.ctl[&ID_FEED], &link);
         if !ui.busy {
@@ -1777,12 +1869,6 @@ fn update_buttons() {
             .and_then(|s| sh.lib.show(s))
             .and_then(|s| s.episodes.iter().find(|e| Some(&e.guid) == guid.as_ref()))
             .map(|e| e.state);
-        let any_transcribed = sh
-            .lib
-            .shows
-            .iter()
-            .flat_map(|s| &s.episodes)
-            .any(|e| e.state == State::Transcribed && e.record.short_hash().is_some());
         let selected_eligible = {
             selected_indices(ui.ctl[&ID_EPS]).iter().any(|&i| {
                 ui.ep_guids
@@ -1795,6 +1881,12 @@ fn update_buttons() {
             })
         };
         let pending = sh.queue.pending_count();
+        let any_transcribed = sh
+            .lib
+            .shows
+            .iter()
+            .flat_map(|s| &s.episodes)
+            .any(|e| e.state == State::Transcribed && e.record.short_hash().is_some());
         drop(sh);
         let idle = !ui.busy;
         let en = |id: i32, on: bool| {
@@ -1804,6 +1896,11 @@ fn update_buttons() {
         };
         en(B_ADD, idle);
         en(B_REFRESH, idle && !ui.show_ids.is_empty());
+        en(B_REFRESH_MORE, idle && !ui.show_ids.is_empty());
+        if let Some(h) = ui.ctl.get(&B_AUTOQ) {
+            SetWindowLongPtrW(*h, GWLP_USERDATA, ui.autoq_on as isize);
+            let _ = InvalidateRect(*h, None, false);
+        }
         en(B_PROCESS, selected_eligible || (idle && pending > 0));
         en(B_PROMPT, st == Some(State::Transcribed));
         en(B_BULK, any_transcribed);
@@ -1901,10 +1998,11 @@ fn bulk_pending() -> bool {
 /// Right-click on the episode list: select the row under the pointer (unless
 /// it is already part of the selection) and open the seen/unseen menu.
 unsafe fn episode_menu(lp: LPARAM) {
-    let Some((list, busy)) = with(|ui| (ui.ctl[&ID_EPS], ui.busy)) else {
+    // Marks can change while a job or the queue runs.
+    let Some(list) = with(|ui| ui.ctl[&ID_EPS]) else {
         return;
     };
-    if busy || !IsWindowVisible(list).as_bool() {
+    if !IsWindowVisible(list).as_bool() {
         return;
     }
     let mut pt = windows::Win32::Foundation::POINT {
@@ -2213,6 +2311,169 @@ fn start_queue() {
     });
 }
 
+/// Check every show for new episodes. With `then_queue`, or with
+/// `[episodes] queue-after-refresh` on, every NEW episode is queued after.
+fn check_for_new(then_queue: bool) {
+    if with(|ui| ui.busy).unwrap_or(true) {
+        return;
+    }
+    let then_queue = then_queue || with(|ui| ui.shared.lock().unwrap().conf.queue_after_refresh()).unwrap_or(false);
+            const STAGE: &str = "Checking every show for new episodes";
+            background(STAGE, move |shared| {
+                let targets: Vec<refresh::Target> = shared
+                    .lock()
+                    .unwrap()
+                    .lib
+                    .shows
+                    .iter()
+                    .map(|s| {
+                        let name = if s.title.trim().is_empty() {
+                            &s.feed_url
+                        } else {
+                            &s.title
+                        };
+                        (s.id, name.clone(), s.feed_url.clone())
+                    })
+                    .collect();
+                let apply = |id: u32, feed: &rss::SourceFeed| {
+                    let mut sh = shared.lock().unwrap();
+                    sh.lib.show_mut(id).map(|s| pipeline::merge_feed(s, feed))
+                };
+                let done = |n: usize, total: usize| set_progress(STAGE, n as f64 / total as f64);
+                let out = refresh::check_all(&targets, 4, &net::get, &apply, &cancelled, &done);
+                if !cancelled() {
+                    let (paths, items): (Paths, Vec<_>) = {
+                        let sh = shared.lock().unwrap();
+                        let items = targets
+                            .iter()
+                            .filter_map(|(id, _, _)| sh.lib.show(*id))
+                            .map(|s| artwork::collect_show_urls(s, 10))
+                            .collect();
+                        (Paths::new(sh.paths.root.clone()), items)
+                    };
+                    artwork::sync_shows(&paths, &items, 4, &net::get, &cancelled);
+                }
+                let mut msg = refresh::summary(&out, targets.len(), out.len() < targets.len());
+                if then_queue && !cancelled() {
+                    let mut sh = shared.lock().unwrap();
+                    let lib = sh.lib.clone();
+                    let (waiting, max_show) = sh.queue.new_waiting_counts(&lib, None);
+                    if waiting == 0 {
+                        msg.push_str(" No NEW episodes to queue.");
+                    } else if Queue::add_new_needs_confirm(waiting, max_show) {
+                        *AUTOQUEUE_ASK.lock().unwrap() = Some(None);
+                        msg.push_str(&format!(
+                            " {} waiting. Confirm in the next dialog to queue them.",
+                            store::plural(waiting, "NEW episode")
+                        ));
+                    } else {
+                        let (added, _) = sh.queue.add_new(&lib, None);
+                        let _ = sh.queue.save(&sh.paths.queue());
+                        msg.push_str(&format!(
+                            " Queued {}.",
+                            store::plural(added, "NEW episode")
+                        ));
+                    }
+                }
+                Ok(msg)
+            });
+        }
+
+fn autoqueue_confirm_text(total: usize, max_per_show: usize, only_show: Option<u32>) -> String {
+    if only_show.is_some() {
+        format!(
+            "This would queue {} in this show. That includes every NEW episode already in the show, not only ones found just now. Queue them anyway?",
+            store::plural(total, "NEW episode")
+        )
+    } else {
+        format!(
+            "This would queue {} ({} in one show). That includes every NEW episode already in the library, not only ones found just now. Queue them anyway?",
+            store::plural(total, "NEW episode"),
+            max_per_show
+        )
+    }
+}
+
+fn ask_yes_no(hwnd: HWND, title: &str, text: &str) -> bool {
+    unsafe {
+        let title = wide(title);
+        let text = wide(text);
+        MessageBoxW(
+            hwnd,
+            windows::core::PCWSTR(text.as_ptr()),
+            windows::core::PCWSTR(title.as_ptr()),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        ) == IDYES
+    }
+}
+
+/// Queue every NEW episode (of one show, or of all) and start the queue.
+fn queue_all_new(only: Option<u32>) {
+    if with(|ui| ui.queue_preview).unwrap_or(true) {
+        return;
+    }
+    let (waiting, max_show, hwnd) = with(|ui| {
+        let sh = ui.shared.lock().unwrap();
+        let (n, m) = sh.queue.new_waiting_counts(&sh.lib, only);
+        (n, m, ui.hwnd)
+    })
+    .unwrap_or((0, 0, HWND::default()));
+    if waiting > 0 && Queue::add_new_needs_confirm(waiting, max_show) {
+        let text = autoqueue_confirm_text(waiting, max_show, only);
+        if !ask_yes_no(hwnd, "Queue NEW episodes", &text) {
+            with(|ui| status(ui, "Queue NEW cancelled."));
+            return;
+        }
+    }
+    let msg = with(|ui| {
+        let mut sh = ui.shared.lock().unwrap();
+        let lib = sh.lib.clone();
+        let (added, _) = sh.queue.add_new(&lib, only);
+        let m = match (added, only) {
+            (0, Some(_)) => "No NEW episodes in this show to queue. OLD, SENT, transcribed and already queued episodes are left out.".to_string(),
+            (0, None) => "No NEW episodes to queue. OLD, SENT, transcribed and already queued episodes are left out.".to_string(),
+            _ => format!("Queued {}.", store::plural(added, "NEW episode")),
+        };
+        // Kept in the log so the next list refresh shows it rather than an older line.
+        sh.note(m.clone());
+        sh.save();
+        Some(m)
+    })
+    .flatten();
+    if let Some(m) = msg {
+        refresh_lists();
+        with(|ui| status(ui, &m));
+        update_buttons();
+        start_queue();
+    }
+}
+
+/// Right-click on the show list. Returns whether the click was on it.
+unsafe fn show_menu(lp: LPARAM) -> bool {
+    let Some(list) = with(|ui| ui.ctl[&ID_SHOWS]) else {
+        return false;
+    };
+    let pt = windows::Win32::Foundation::POINT {
+        x: (lp.0 & 0xffff) as i16 as i32,
+        y: ((lp.0 >> 16) & 0xffff) as i16 as i32,
+    };
+    let mut lr = RECT::default();
+    let _ = GetWindowRect(list, &mut lr);
+    if !IsWindowVisible(list).as_bool() || pt.x < lr.left || pt.x >= lr.right || pt.y < lr.top || pt.y >= lr.bottom {
+        return false;
+    }
+    let mut c = pt;
+    let _ = windows::Win32::Graphics::Gdi::ScreenToClient(list, &mut c);
+    let hit = SendMessageW(list, LB_ITEMFROMPOINT, WPARAM(0), LPARAM(((c.y as isize & 0xffff) << 16) | (c.x as isize & 0xffff))).0;
+    if (hit >> 16) & 0xffff == 0 {
+        SendMessageW(list, LB_SETCURSEL, WPARAM((hit & 0xffff) as usize), LPARAM(0));
+        refresh_lists();
+        update_buttons();
+    }
+    open_menu_w(pt.x, pt.y, QUEUE_MENU_W, ID_SHOWS, SHOW_MENU.iter().map(|s| s.to_string()).collect());
+    true
+}
+
 fn enqueue_selected_and_run() {
     let msg = with(|ui| {
         let show = selected(ui, ID_SHOWS).and_then(|i| ui.show_ids.get(i).copied());
@@ -2358,49 +2619,7 @@ fn on_command(id: i32, code: u32) {
             });
             with(|ui| set_text(ui.ctl[&ID_URL], ""));
         }
-        B_REFRESH => {
-            const STAGE: &str = "Checking every show for new episodes";
-            background(STAGE, move |shared| {
-                let targets: Vec<refresh::Target> = shared
-                    .lock()
-                    .unwrap()
-                    .lib
-                    .shows
-                    .iter()
-                    .map(|s| {
-                        let name = if s.title.trim().is_empty() {
-                            &s.feed_url
-                        } else {
-                            &s.title
-                        };
-                        (s.id, name.clone(), s.feed_url.clone())
-                    })
-                    .collect();
-                let apply = |id: u32, feed: &rss::SourceFeed| {
-                    let mut sh = shared.lock().unwrap();
-                    sh.lib.show_mut(id).map(|s| pipeline::merge_feed(s, feed))
-                };
-                let done = |n: usize, total: usize| set_progress(STAGE, n as f64 / total as f64);
-                let out = refresh::check_all(&targets, 4, &net::get, &apply, &cancelled, &done);
-                if !cancelled() {
-                    let (paths, items): (Paths, Vec<_>) = {
-                        let sh = shared.lock().unwrap();
-                        let items = targets
-                            .iter()
-                            .filter_map(|(id, _, _)| sh.lib.show(*id))
-                            .map(|s| artwork::collect_show_urls(s, 10))
-                            .collect();
-                        (Paths::new(sh.paths.root.clone()), items)
-                    };
-                    artwork::sync_shows(&paths, &items, 4, &net::get, &cancelled);
-                }
-                Ok(refresh::summary(
-                    &out,
-                    targets.len(),
-                    out.len() < targets.len(),
-                ))
-            });
-        }
+        B_REFRESH => check_for_new(false),
         B_PROCESS => enqueue_selected_and_run(),
         B_PROMPT => {
             let text = with(|ui| {
@@ -2682,6 +2901,22 @@ fn on_command(id: i32, code: u32) {
             with(|ui| ui.token_on = !ui.token_on);
             update_buttons();
         }
+        B_AUTOQ => {
+            with(|ui| ui.autoq_on = !ui.autoq_on);
+            update_buttons();
+        }
+        B_REFRESH_MORE => unsafe {
+            // Opens upward from Check for new, so the feed link row stays visible.
+            if let Some(h) = with(|ui| ui.ctl[&B_REFRESH]) {
+                let mut r = RECT::default();
+                let _ = GetWindowRect(h, &mut r);
+                let d = DPI.load(std::sync::atomic::Ordering::Relaxed);
+                let items: Vec<String> = REFRESH_MENU.iter().map(|s| s.to_string()).collect();
+                let height = scale(DROP_ROW, d) * items.len() as i32 + 2;
+                open_popup(r.left, r.top - height, scale(QUEUE_MENU_W, d), B_REFRESH_MORE, items, -1);
+            }
+        },
+        B_QNEW => queue_all_new(None),
         B_SAVE => {
             with(|ui| {
                 let v: Vec<String> = (0..OPTION_LABELS.len() as i32)
@@ -2722,6 +2957,7 @@ fn on_command(id: i32, code: u32) {
                             if let Some(n) = bulk {
                                 c.set("prompt", "bulk-size", &n.to_string());
                             }
+                            c.set("episodes", "queue-after-refresh", if ui.autoq_on { "on" } else { "off" });
                         })
                     })
                     .and_then(|_| sh.conf.set_folder("export", &v[6]));
@@ -2780,10 +3016,27 @@ unsafe fn text(
     color: u32,
     flags: windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT,
 ) {
-    let mut w: Vec<u16> = s.encode_utf16().collect();
+    // An empty Vec's pointer is a dangling placeholder (0x2); Windows'
+    // DrawTextW can read it even with a zero count and crash inside
+    // user32. Skip empty labels (the blank "Queue N NEW" link).
+    let Some(mut w) = draw_text_units(s) else {
+        return;
+    };
+    let n = w.len() - 1;
     SetTextColor(dc, COLORREF(color));
     SetBkMode(dc, TRANSPARENT);
-    DrawTextW(dc, &mut w, r, flags | DT_NOPREFIX);
+    DrawTextW(dc, &mut w[..n], r, flags | DT_NOPREFIX);
+}
+
+/// UTF-16 for DrawTextW with a trailing NUL kept in the buffer (not in the
+/// count), or None when there is nothing to draw.
+fn draw_text_units(s: &str) -> Option<Vec<u16>> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut w: Vec<u16> = s.encode_utf16().collect();
+    w.push(0);
+    Some(w)
 }
 
 unsafe fn fill(dc: HDC, r: &RECT, color: u32) {
@@ -2807,6 +3060,7 @@ unsafe fn arrow(dc: HDC, r: &RECT, up: bool, color: u32) {
 }
 
 unsafe fn paint(hwnd: HWND) {
+    podcast_trim::crash::trace_first_paint();
     let mut ps = PAINTSTRUCT::default();
     let dc = BeginPaint(hwnd, &mut ps);
     with(|ui| {
@@ -2830,6 +3084,7 @@ unsafe fn paint(hwnd: HWND) {
             None,
             DI_NORMAL,
         );
+        podcast_trim::crash::trace_once("paint: caption", String::new);
         let mut tr = sr(ui, 30, 2, 400, CAPTION_H - 2);
         text(
             dc,
@@ -2838,6 +3093,7 @@ unsafe fn paint(hwnd: HWND) {
             TEXT,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER,
         );
+        podcast_trim::crash::trace_once("paint: frames", String::new);
         // Tab sheet.
         let sheet = sr(ui, 14, 52, cw - 28, ch - 52 - 10);
         bevel(dc, &sheet, true);
@@ -2859,6 +3115,7 @@ unsafe fn paint(hwnd: HWND) {
         if !IsZoomed(hwnd).as_bool() {
             grip(dc, &rc);
         }
+        podcast_trim::crash::trace_once("paint: labels", || format!("{} labels", ui.labels.len()));
         for (r, s, p, kind) in &ui.labels {
             if *p != page {
                 continue;
@@ -2872,10 +3129,10 @@ unsafe fn paint(hwnd: HWND) {
             text(dc, s, &mut r, TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         }
         if ui.page == PAGE_OPT {
-            let mut r = sr(ui, 668 + cw - WIN_W, 168, 208, 160);
+            let mut r = sr(ui, 668 + cw - WIN_W, 200, 208, 190);
             text(
                 dc,
-                "NEW on add: how many of a new show's newest episodes are listed as NEW; older ones are listed as OLD. Bulk prompt size: the most episodes in one bulk AI prompt (1 to 20). Both are also in configuration.conf.",
+                "NEW on add: how many of a new show's newest episodes are listed as NEW; older ones are listed as OLD. Bulk prompt size: the most episodes in one bulk AI prompt (1 to 20). Queue NEW after Check for new: NEW episodes go into the queue after each check. All three are also in configuration.conf.",
                 &mut r,
                 DIM,
                 DT_LEFT | windows::Win32::Graphics::Gdi::DT_WORDBREAK,
@@ -2897,6 +3154,7 @@ unsafe fn paint(hwnd: HWND) {
         SelectObject(dc, old);
     });
     let _ = EndPaint(hwnd, &ps);
+    podcast_trim::crash::trace_once("paint: done", String::new);
 }
 
 thread_local! {
@@ -2922,8 +3180,13 @@ unsafe fn open_dropdown(btn: HWND, owner: i32, items: Vec<String>, current: &str
 /// The same list used as a right-click menu at screen point (x, y), moved
 /// up or left if it would go off the monitor.
 unsafe fn open_menu(x: i32, y: i32, owner: i32, items: Vec<String>) {
+    open_menu_w(x, y, 170, owner, items);
+}
+
+/// `open_menu` with a width in 96-DPI pixels.
+unsafe fn open_menu_w(x: i32, y: i32, width: i32, owner: i32, items: Vec<String>) {
     let d = DPI.load(std::sync::atomic::Ordering::Relaxed);
-    let (w, h) = (scale(170, d), scale(DROP_ROW, d) * items.len() as i32 + 2);
+    let (w, h) = (scale(width, d), scale(DROP_ROW, d) * items.len() as i32 + 2);
     let (l, t, r, b) = work_area((x, y, 1, 1));
     let x = if x + w > r { (x - w).max(l) } else { x };
     let y = if y + h > b { (y - h).max(t) } else { y };
@@ -3160,6 +3423,10 @@ unsafe fn draw_list_item(dis: &DRAWITEMSTRUCT) {
     );
     let label = String::from_utf16_lossy(&buf[..n]);
     let dim = SendMessageW(dis.hwndItem, LB_GETITEMDATA, WPARAM(dis.itemID as usize), LPARAM(0)).0 == 1;
+    podcast_trim::crash::trace_once(
+        &format!("draw list item ctl={} dim={dim} sel={sel}", dis.CtlID),
+        || format!("row {} ({} chars)", dis.itemID, n),
+    );
     let brush = CreateSolidBrush(COLORREF(if sel { SEL } else { FIELD }));
     FillRect(dc, &r, brush);
     let _ = DeleteObject(brush);
@@ -3194,7 +3461,10 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
     let n = GetWindowTextLengthW(dis.hwndItem);
     let mut buf = vec![0u16; n as usize + 1];
     let got = GetWindowTextW(dis.hwndItem, &mut buf);
-    let label = String::from_utf16_lossy(&buf[..got as usize]);
+    let label = String::from_utf16_lossy(&buf[..got.max(0) as usize]);
+    podcast_trim::crash::trace_once(&format!("draw button {id}"), || {
+        format!("{} chars, disabled={disabled}", label.chars().count())
+    });
     let flags = DT_LEFT | DT_SINGLELINE | DT_VCENTER;
     match id {
         B_MIN | B_MAX | B_CLOSE => {
@@ -3266,7 +3536,25 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
             tr.left += scale(6, d);
             text(dc, &label, &mut tr, if active { TAN } else { TEXT }, flags);
         }
-        B_TOKEN => {
+        B_QNEW => {
+            // A plain tan link on the header bar; nothing when there is no NEW.
+            let hot = pressed && !disabled;
+            let mut tr = r;
+            tr.right -= scale(4, d);
+            text(dc, &label, &mut tr, if hot { rgb(255, 255, 255) } else { TAN }, windows::Win32::Graphics::Gdi::DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+        }
+        B_REFRESH_MORE => {
+            bevel(dc, &r, !pressed);
+            let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2 + 1);
+            let p = CreatePen(PS_SOLID, 1, COLORREF(if disabled { DIM } else { TEXT }));
+            let o = SelectObject(dc, p);
+            for i in 0..3 {
+                line(dc, cx - 2 + i, cy - 1 + i, cx + 3 - i, cy - 1 + i);
+            }
+            SelectObject(dc, o);
+            let _ = DeleteObject(p);
+        }
+        B_TOKEN | B_AUTOQ => {
             let on = GetWindowLongPtrW(dis.hwndItem, GWLP_USERDATA) != 0;
             let s = scale(13, d);
             let bx = RECT {
@@ -3374,6 +3662,7 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
         }
     }
     SelectObject(dc, old);
+    podcast_trim::crash::trace_once(&format!("draw button {id} done"), String::new);
 }
 
 /// Parent that hides a list's or edit's own scroll bar; forwards everything
@@ -3650,6 +3939,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_NCCALCSIZE => {
+            podcast_trim::crash::trace_first_nccalcsize();
             // No system frame: the client area is the whole window (the
             // first RECT of either form of lParam). A maximized window hangs
             // over the work area by the frame size; clip the client to the
@@ -3706,6 +3996,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_SIZE => {
+            podcast_trim::crash::trace_first_size();
             if wp.0 as u32 != SIZE_MINIMIZED {
                 remember_normal(hwnd);
                 layout();
@@ -3716,11 +4007,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_CONTEXTMENU => {
+            if show_menu(lp) {
+                return LRESULT(0);
+            }
             episode_menu(lp);
             LRESULT(0)
         }
         WM_MODEL_PICK if lp.0 as i32 == ID_EPS => {
             seen_menu_pick(wp.0);
+            LRESULT(0)
+        }
+        WM_MODEL_PICK if lp.0 as i32 == B_REFRESH_MORE => {
+            match wp.0 {
+                0 => check_for_new(false),
+                1 => check_for_new(true),
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_MODEL_PICK if lp.0 as i32 == ID_SHOWS => {
+            let show = with(|ui| selected(ui, ID_SHOWS).and_then(|i| ui.show_ids.get(i).copied())).flatten();
+            match wp.0 {
+                0 if show.is_some() => queue_all_new(show),
+                1 => check_for_new(true),
+                _ => {}
+            }
             LRESULT(0)
         }
         WM_MODEL_PICK => {
@@ -3800,6 +4111,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 });
             }
             refresh_lists();
+            let ask = AUTOQUEUE_ASK.lock().unwrap().take();
+            if let Some(only) = ask {
+                queue_all_new(only);
+            }
             if wp.0 == 1 {
                 let again = with(|ui| {
                     !ui.busy
@@ -3819,5 +4134,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::draw_text_units;
+
+    /// Regression: the blank "Queue N NEW" link (every NEW already queued)
+    /// handed DrawTextW an empty slice whose pointer is a dangling 0x2,
+    /// which crashed inside user32 on Windows at the first paint.
+    #[test]
+    fn empty_label_is_not_drawn() {
+        assert!(draw_text_units("").is_none());
+    }
+
+    #[test]
+    fn label_buffer_is_nul_terminated_outside_the_count() {
+        let w = draw_text_units("Queue 5 NEW").unwrap();
+        assert_eq!(w.last(), Some(&0));
+        assert_eq!(String::from_utf16(&w[..w.len() - 1]).unwrap(), "Queue 5 NEW");
     }
 }
