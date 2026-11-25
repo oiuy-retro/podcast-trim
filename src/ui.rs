@@ -1459,7 +1459,6 @@ fn show_details() {
     });
 }
 
-<<<<<<< HEAD
 /// Words from the transcript that overlap a cut, indented under its times.
 fn append_cut_words(t: &mut String, transcript: &str, start: f64, end: f64) {
     let words = transcript::text_in_range(transcript, start, end);
@@ -1472,10 +1471,7 @@ fn append_cut_words(t: &mut String, transcript: &str, start: f64, end: f64) {
     t.push('\n');
 }
 
-/// e.g. "Source mp3 55 kbps stereo (identical channels) -> Opus 32 kbps mono (Auto)".
-=======
 /// e.g. "Source mp3 55 kbps stereo (identical channels) -> Opus 64 kbps mono (Auto)".
->>>>>>> origin/main
 fn source_line(e: &store::Episode, s: &Settings) -> String {
     let r = &e.record;
     let mut src = r.codec.clone();
