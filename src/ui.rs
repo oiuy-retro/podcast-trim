@@ -1611,6 +1611,12 @@ fn feed_link(ui: &Ui, sh: &Shared, id: u32) -> String {
 }
 
 fn refresh_lists() {
+    refresh_lists_keep(None);
+}
+
+/// Rebuild the lists, optionally selecting `keep_guid` (after the show list
+/// already points at that episode's show).
+fn refresh_lists_keep(keep_guid: Option<&str>) {
     with(|ui| {
         let keep_show = selected(ui, ID_SHOWS);
         let keep_ep = selected_indices(ui.ctl[&ID_EPS]);
@@ -1666,12 +1672,17 @@ fn refresh_lists() {
                     .collect()
             })
             .unwrap_or_default();
-        ui.ep_guids = guids;
         let none = if show.is_some() {
             "This show has no episodes yet."
         } else {
             "No show is selected."
         };
+        let keep_ep = if let Some(g) = keep_guid {
+            guids.iter().position(|x| x == g).into_iter().collect()
+        } else {
+            keep_ep
+        };
+        ui.ep_guids = guids;
         fill_list(ui.ctl[&ID_EPS], &eps, &keep_ep, none);
         set_dimmed(ui.ctl[&ID_EPS], &dim);
         if let Some(h) = ui.ctl.get(&B_QNEW) {
@@ -1888,14 +1899,14 @@ impl Env for Labeled<'_> {
     }
 }
 
-/// "\"Title\" in Show" for the episode whose audio has this short hash.
-fn hash_owner(lib: &Library, hash: &str) -> Option<String> {
-    lib.shows.iter().find_map(|s| {
-        s.episodes
-            .iter()
-            .find(|e| e.record.short_hash() == Some(hash))
-            .map(|e| format!("\"{}\" in {}", e.title, s.title))
-    })
+/// Select this episode in the lists so Details and Approve and cut follow it.
+fn select_episode(show: u32, guid: &str) {
+    with(|ui| unsafe {
+        if let Some(i) = ui.show_ids.iter().position(|&id| id == show) {
+            SendMessageW(ui.ctl[&ID_SHOWS], LB_SETCURSEL, WPARAM(i), LPARAM(0));
+        }
+    });
+    refresh_lists_keep(Some(guid));
 }
 
 /// Details text for a checked bulk reply.
@@ -2501,18 +2512,13 @@ fn on_command(id: i32, code: u32) {
         }
         B_CHECK => {
             BULK.with(|b| b.borrow_mut().clear());
-            with(|ui| {
+            // Single-hash replies are matched by hash, like a bulk reply,
+            // even when another transcribed episode is selected.
+            let outcome = with(|ui| {
                 let reply = get_text(ui.ctl[&ID_REPLY]);
                 let sh = ui.shared.lock().unwrap();
-                let ep = show
-                    .and_then(|s| sh.lib.show(s))
-                    .and_then(|s| s.episodes.iter().find(|e| Some(&e.guid) == guid.as_ref()))
-                    .filter(|e| e.state == State::Transcribed)
-                    .cloned();
                 let sections = cutlist::parse_sections(&reply).map(|s| s.len()).unwrap_or(0);
-                // A reply for several episodes, or one with no transcribed
-                // episode selected: match every part to its episode by hash.
-                let Some(ep) = ep.filter(|_| sections <= 1) else {
+                if sections > 1 {
                     let res = pipeline::check_bulk(&sh.lib, &reply);
                     drop(sh);
                     ui.pending = None;
@@ -2524,38 +2530,44 @@ fn on_command(id: i32, code: u32) {
                         }
                         Err(e) => status(ui, &format!("The reply was not accepted: {e}")),
                     }
-                    return;
-                };
-                if let Some(other) = cutlist::parse_sections(&reply)
-                    .ok()
-                    .and_then(|s| s.into_iter().next())
-                    .filter(|s| Some(s.hash.as_str()) != ep.record.short_hash())
-                    .and_then(|s| hash_owner(&sh.lib, &s.hash))
-                {
-                    drop(sh);
-                    ui.pending = None;
-                    status(ui, &format!("The reply was not accepted: its hash is for {other}. Select that episode first."));
-                    return;
+                    return None;
                 }
-                let paths = Paths::new(sh.paths.root.clone());
-                let settings = sh.settings.clone();
-                drop(sh);
-                match pipeline::check_reply(&ep, &reply) {
-                    Ok(cuts) => {
+                let res = pipeline::check_one(&sh.lib, &reply);
+                match res {
+                    Ok(b) => {
+                        let Some(ep) = sh
+                            .lib
+                            .show(b.show)
+                            .and_then(|s| s.episodes.iter().find(|e| e.guid == b.guid))
+                            .cloned()
+                        else {
+                            ui.pending = None;
+                            status(ui, "The reply was not accepted: that episode is gone.");
+                            return None;
+                        };
+                        let redirected = show != Some(b.show) || guid.as_ref() != Some(&b.guid);
+                        let for_line = format!("Cuts are for: {} - {}", b.show_title, b.title);
+                        let paths = Paths::new(sh.paths.root.clone());
+                        let settings = sh.settings.clone();
                         let args = ffargs::cut_args(
-                            &paths.original(show.unwrap(), &ep),
-                            &paths.cleaned(show.unwrap(), &ep),
-                            &cuts,
+                            &paths.original(b.show, &ep),
+                            &paths.cleaned(b.show, &ep),
+                            &b.cuts,
                             ep.record.duration,
                             pipeline::target(&settings, &ep).kbps,
                             pipeline::target(&settings, &ep).mono,
                         );
-                        let mut t = format!(
+                        let mut t = String::new();
+                        if redirected {
+                            t.push_str(&for_line);
+                            t.push_str("\n\n");
+                        }
+                        t.push_str(&format!(
                             "{} cut(s), {} removed:\n",
-                            cuts.len(),
-                            format_time(removed_seconds(&cuts))
-                        );
-                        for c in &cuts {
+                            b.cuts.len(),
+                            format_time(removed_seconds(&b.cuts))
+                        ));
+                        for c in &b.cuts {
                             t.push_str(&format!(
                                 "  {} - {}  ({})\n",
                                 format_time(c.start),
@@ -2566,16 +2578,33 @@ fn on_command(id: i32, code: u32) {
                         t.push_str("\nffmpeg command the app will run:\n");
                         t.push_str(&ffargs::display("ffmpeg.exe", &args));
                         t.push_str("\n\nPress Approve and cut to go ahead.");
+                        let st = if redirected {
+                            format!("{for_line}. Review the cut list in Details.")
+                        } else {
+                            "Cut list checked. Review it in Details.".into()
+                        };
+                        ui.pending = Some((b.show, b.guid.clone(), b.cuts.clone()));
                         set_text(ui.ctl[&ID_VIEW], &t);
-                        ui.pending = Some((show.unwrap(), ep.guid.clone(), cuts));
-                        status(ui, "Cut list checked. Review it in Details.");
+                        status(ui, &st);
+                        Some((b.show, b.guid, t, st, redirected))
                     }
                     Err(e) => {
                         ui.pending = None;
                         status(ui, &format!("The reply was not accepted: {e}"));
+                        None
                     }
                 }
-            });
+            })
+            .flatten();
+            if let Some((s, g, text, st, redirected)) = outcome {
+                if redirected {
+                    select_episode(s, &g);
+                    with(|ui| {
+                        set_text(ui.ctl[&ID_VIEW], &text);
+                        status(ui, &st);
+                    });
+                }
+            }
             update_buttons();
         }
         B_APPROVE if bulk_pending() => {
@@ -2613,12 +2642,11 @@ fn on_command(id: i32, code: u32) {
             });
         }
         B_APPROVE => {
+            // Apply to the episode the checked reply named, even if the
+            // selection has moved on.
             let Some((s, g, cuts)) = with(|ui| ui.pending.take()).flatten() else {
                 return;
             };
-            if Some(s) != show || Some(&g) != guid.as_ref() {
-                return;
-            }
             with(|ui| set_text(ui.ctl[&ID_REPLY], ""));
             background(
                 "Cutting",

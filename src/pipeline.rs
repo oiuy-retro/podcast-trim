@@ -213,9 +213,9 @@ pub fn transcribe(
     Ok(())
 }
 
-/// Parse + validate an AI reply against this episode.
-/// Check a reply for one episode: it must carry exactly one hash line and
-/// that hash must be this episode's.
+/// Parse + validate an AI reply against this episode. The reply must carry
+/// exactly one hash line, and that hash must be this episode's. Prefer
+/// `check_one` when the episode is chosen from the library by hash.
 pub fn check_reply(ep: &Episode, reply: &str) -> Result<Vec<Cut>, String> {
     let want = ep
         .record
@@ -244,7 +244,23 @@ pub struct BulkCut {
     pub show: u32,
     pub guid: String,
     pub title: String,
+    pub show_title: String,
     pub cuts: Vec<Cut>,
+}
+
+/// Check a single-hash reply and return the transcribed episode it names,
+/// regardless of which episode is selected. Errors when the hash is missing,
+/// when there is more than one hash line, or when the hash does not belong
+/// to a transcribed episode in the library.
+pub fn check_one(lib: &Library, reply: &str) -> Result<BulkCut, String> {
+    let n = cutlist::parse_sections(reply)?.len();
+    if n != 1 {
+        return Err(format!(
+            "the reply has {n} hash lines, but a reply for one episode has one"
+        ));
+    }
+    let mut list = check_bulk(lib, reply)?;
+    list.pop().ok_or_else(|| "the reply was not accepted".into())
 }
 
 /// Check a reply covering several episodes. Every hash must belong to a
@@ -258,7 +274,7 @@ pub fn check_bulk(lib: &Library, reply: &str) -> Result<Vec<BulkCut>, String> {
             sh.episodes
                 .iter()
                 .find(|e| e.record.short_hash() == Some(s.hash.as_str()))
-                .map(|e| (sh.id, e))
+                .map(|e| (sh, e))
         });
         let Some((show, ep)) = found else {
             return Err(format!(
@@ -275,9 +291,14 @@ pub fn check_bulk(lib: &Library, reply: &str) -> Result<Vec<BulkCut>, String> {
         let cuts = cutlist::validate(s.cuts, ep.record.duration)
             .map_err(|e| format!("\"{}\" (hash {}): {e}", ep.title, s.hash))?;
         out.push(BulkCut {
-            show,
+            show: show.id,
             guid: ep.guid.clone(),
             title: ep.title.clone(),
+            show_title: if show.title.is_empty() {
+                show.feed_url.clone()
+            } else {
+                show.title.clone()
+            },
             cuts,
         });
     }
@@ -639,6 +660,37 @@ mod tests {
         let mut no_hash = ep.clone();
         no_hash.record.sha256.clear();
         assert!(check_reply(&no_hash, "hash: 1a2b3c4d5e6f\nNONE").unwrap_err().contains("no audio hash"));
+    }
+
+    #[test]
+    fn single_reply_is_routed_by_hash() {
+        let mut lib = Library::default();
+        let a = lib.add_show("Show A".into(), "ua".into());
+        let b = lib.add_show("Show B".into(), "ub".into());
+        lib.show_mut(a).unwrap().episodes = vec![transcribed("sel", &"a".repeat(64), 300.0)];
+        lib.show_mut(b).unwrap().episodes = vec![transcribed("other", &"b".repeat(64), 300.0)];
+        // Hash of the episode that would be selected.
+        let got = check_one(&lib, "hash: aaaaaaaaaaaa\n00:00:10.000-00:00:20.000").unwrap();
+        assert_eq!(
+            (got.show, got.guid.as_str(), got.title.as_str(), got.show_title.as_str()),
+            (a, "sel", "Ep sel", "Show A")
+        );
+        assert_eq!(got.cuts, vec![Cut { start: 10.0, end: 20.0 }]);
+        // Hash of a different transcribed episode, not the selected one.
+        let got = check_one(&lib, "hash: bbbbbbbbbbbb\n00:00:01.000-00:00:02.000").unwrap();
+        assert_eq!(
+            (got.show, got.guid.as_str(), got.show_title.as_str()),
+            (b, "other", "Show B")
+        );
+        // The same lookup with no episode selected.
+        let got = check_one(&lib, "hash: aaaaaaaaaaaa\nNONE").unwrap();
+        assert!(got.cuts.is_empty() && got.guid == "sel");
+        // Unknown hash: refused, nothing is applied.
+        let e = check_one(&lib, "hash: ffffffffffff\nNONE").unwrap_err();
+        assert!(e.contains("ffffffffffff does not match any episode"), "{e}");
+        // No hash line: refused.
+        let e = check_one(&lib, "00:00:10.000-00:00:20.000").unwrap_err();
+        assert!(e.contains("no hash line"), "{e}");
     }
 
     #[test]
